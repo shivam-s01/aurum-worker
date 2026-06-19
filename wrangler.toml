@@ -1,0 +1,8 @@
+name = "aurum-worker"
+main = "src/index.js"
+compatibility_date = "2024-09-01"
+
+[[kv_namespaces]]
+binding = "STREAM_CACHE"
+id = "3dd630cbe03543bc9a976fe0dedb666d"
+
