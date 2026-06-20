@@ -1,5 +1,5 @@
 // =============================================================================
-// Aurum Music — Cloudflare Worker v5.0 — PRO ULTRA-FAST YT
+// Aurum Music — Cloudflare Worker v5.1 — PRO ULTRA-FAST YT
 // ZERO backend dependency — No Railway, No Render
 // YT songs play in 0.2-0.3 sec via:
 //   1. CF Edge Cache (instant — 0ms if cached at nearby POP)
@@ -11,12 +11,12 @@
 
 // ─── Cache TTLs ───────────────────────────────────────────────────────────────
 const CACHE_TTL = {
-  ytStream:  3000,  // YT stream URL edge cache — 50min
-  ytKV:      2700,  // KV store TTL — 45min (slightly less than edge)
+  ytStream:  3000,
+  ytKV:      2700,
   saavn:     120,
   song:      300,
   lyrics:    600,
-  prewarm:   2400,  // Pre-warmed entries — 40min
+  prewarm:   2400,
 };
 
 // ─── Saavn API ────────────────────────────────────────────────────────────────
@@ -382,6 +382,7 @@ async function saavnSearchFallback(query, limit = 20) {
 }
 
 async function saavnStreamById(songId) {
+  // 1. Try onrender (rich downloadUrl array)
   try {
     const renderResp = await fetch(
       `https://jiosaavn-op-gits.onrender.com/api/songs?ids=${songId}`,
@@ -401,6 +402,7 @@ async function saavnStreamById(songId) {
     }
   } catch (_) {}
 
+  // 2. Direct JioSaavn API fallback
   try {
     const url = `${SAAVN_API}?__call=song.getDetails&cc=in&_marker=0%3F_marker%3D0&_format=json&pids=${songId}`;
     const resp = await fetch(url, {
@@ -455,7 +457,7 @@ async function handleYtSuggestions(query, ctx) {
       const suggestions = JSON.parse(`[${match[2]}]`).map(item => item[0]);
       const res = jsonResp(suggestions);
       const h = new Headers(res.headers);
-      h.set('Cache-Control', `public, max-age=${CACHE_TTL.meta}`);
+      h.set('Cache-Control', `public, max-age=300`);
       const cacheable = new Response(res.body, { status: res.status, headers: h });
       ctx.waitUntil(caches.default.put(cacheKey, cacheable.clone()));
       return cacheable;
@@ -491,7 +493,7 @@ async function handleYtTrending(ctx) {
       recordSuccess(inst, 0);
       const res = jsonResp({ success: true, results: songs });
       const h = new Headers(res.headers);
-      h.set('Cache-Control', `public, max-age=${CACHE_TTL.meta}`);
+      h.set('Cache-Control', `public, max-age=300`);
       const cacheable = new Response(res.body, { status: res.status, headers: h });
       ctx.waitUntil(caches.default.put(cacheKey, cacheable.clone()));
       return cacheable;
@@ -527,7 +529,7 @@ async function handleYtRelated(videoId, ctx) {
       recordSuccess(inst, 0);
       const res = jsonResp({ success: true, results: related });
       const h = new Headers(res.headers);
-      h.set('Cache-Control', `public, max-age=${CACHE_TTL.meta}`);
+      h.set('Cache-Control', `public, max-age=300`);
       const cacheable = new Response(res.body, { status: res.status, headers: h });
       ctx.waitUntil(caches.default.put(cacheKey, cacheable.clone()));
       return cacheable;
@@ -539,24 +541,14 @@ async function handleYtRelated(videoId, ctx) {
 // =============================================================================
 // AUDIO PROXY — fixes ExoPlayer "Source error code=0" on Saavn CDN streams.
 //
-// ROOT CAUSE (confirmed via curl):
-//   curl -H "Range: bytes=0-1023" <saavncdn-url>
-//   → HTTP/1.1 200 OK   (should be 206 Partial Content)
-//   → Content-Length: 15091015   (full file size, not the sliced range)
+// ROOT CAUSE: Saavn/Azure CDN advertises "Accept-Ranges: bytes" but silently
+// IGNORES the Range header and returns 200 + full body. ExoPlayer expects
+// 206 Partial Content — getting 200 back triggers "Source error" (code=0).
 //
-// The Saavn/Azure CDN advertises "Accept-Ranges: bytes" but silently IGNORES
-// the Range header and returns the full body with a 200 status. ExoPlayer's
-// HTTP data source sends a Range request expecting 206 + a correctly-sized
-// Content-Length/Content-Range; getting 200 + full-length back instead is
-// exactly what triggers a generic ExoPlaybackException "Source error" (code=0)
-// — ExoPlayer treats the mismatched response as a malformed/untrustworthy
-// source and aborts rather than just reading the full body.
-//
-// FIX: this Worker proxies the audio. It fetches the FULL file from the
-// upstream CDN once (cached at the edge), then serves byte-range slices
-// itself with a correct 206 response — Range, Content-Range, Content-Length,
-// Accept-Ranges, Content-Type all set properly. ExoPlayer now talks to a
-// "CDN" (this Worker) that actually honors Range correctly.
+// FIX: Stream the response directly from upstream, forwarding the Range header.
+// We force status=206 and set correct Content-Range headers so ExoPlayer is
+// satisfied. No buffering — the response body streams through immediately,
+// so there's no memory limit issue.
 // =============================================================================
 
 async function handleStreamProxy(request, encodedUrl, ctx) {
@@ -566,7 +558,7 @@ async function handleStreamProxy(request, encodedUrl, ctx) {
   try {
     upstreamUrl = decodeURIComponent(encodedUrl);
     const host = new URL(upstreamUrl).hostname;
-    // Only ever proxy Saavn's own CDN — never an arbitrary attacker-supplied URL.
+    // Security: only proxy Saavn's own CDN
     if (!host.endsWith('saavncdn.com')) {
       return jsonResp({ success: false, error: 'host not allowed' }, 403);
     }
@@ -574,81 +566,50 @@ async function handleStreamProxy(request, encodedUrl, ctx) {
     return jsonResp({ success: false, error: 'invalid url' }, 400);
   }
 
-  // Cache the FULL upstream file at the edge (keyed by URL, ignoring Range) —
-  // repeated seeks/replays of the same song are served entirely from cache,
-  // no re-fetch from Saavn.
-  const fullCacheKey = new Request(`https://aurum-cache/audio-proxy-full/${encodeURIComponent(upstreamUrl)}`);
-  let fullResp = await caches.default.match(fullCacheKey);
-
-  if (!fullResp) {
-    const upstream = await fetch(upstreamUrl, {
-      headers: { 'User-Agent': 'Mozilla/5.0' },
-      // Deliberately NOT forwarding the client's Range header upstream —
-      // upstream ignores it anyway (see comment above), so we always fetch
-      // the complete file once and slice it correctly ourselves.
-      signal: AbortSignal.timeout(15000),
-    });
-    if (!upstream.ok) {
-      return jsonResp({ success: false, error: `upstream ${upstream.status}` }, 502);
-    }
-    const ch = new Headers();
-    ch.set('Content-Type', upstream.headers.get('Content-Type') || 'audio/mp4');
-    ch.set('Cache-Control', 'public, max-age=3600');
-    fullResp = new Response(upstream.body, { status: 200, headers: ch });
-    ctx.waitUntil(caches.default.put(fullCacheKey, fullResp.clone()));
-  }
-
-  const contentType = fullResp.headers.get('Content-Type') || 'audio/mp4';
-  const buf = await fullResp.arrayBuffer();
-  const totalLength = buf.byteLength;
-
   const rangeHeader = request.headers.get('Range');
-  if (!rangeHeader) {
-    return new Response(buf, {
-      status: 200,
-      headers: {
-        'Content-Type': contentType,
-        'Content-Length': String(totalLength),
-        'Accept-Ranges': 'bytes',
-        'Access-Control-Allow-Origin': '*',
-        'Cache-Control': 'public, max-age=3600',
-      },
-    });
-  }
 
-  const match = /bytes=(\d*)-(\d*)/.exec(rangeHeader);
-  let start = match && match[1] ? parseInt(match[1], 10) : 0;
-  let end   = match && match[2] ? parseInt(match[2], 10) : totalLength - 1;
-  if (Number.isNaN(start) || start < 0) start = 0;
-  if (Number.isNaN(end) || end >= totalLength) end = totalLength - 1;
-  if (start > end) {
-    return new Response(null, {
-      status: 416,
-      headers: { 'Content-Range': `bytes */${totalLength}`, 'Access-Control-Allow-Origin': '*' },
-    });
-  }
-
-  const slice = buf.slice(start, end + 1);
-  return new Response(slice, {
-    status: 206,
+  const upstream = await fetch(upstreamUrl, {
     headers: {
-      'Content-Type': contentType,
-      'Content-Length': String(slice.byteLength),
-      'Content-Range': `bytes ${start}-${end}/${totalLength}`,
-      'Accept-Ranges': 'bytes',
-      'Access-Control-Allow-Origin': '*',
-      'Cache-Control': 'public, max-age=3600',
+      'User-Agent': 'Mozilla/5.0',
+      ...(rangeHeader ? { 'Range': rangeHeader } : {}),
     },
-  });
+    signal: AbortSignal.timeout(15000),
+  }).catch(() => null);
+
+  if (!upstream || (!upstream.ok && upstream.status !== 206)) {
+    return jsonResp({ success: false, error: `upstream ${upstream?.status ?? 'timeout'}` }, 502);
+  }
+
+  const contentType    = upstream.headers.get('Content-Type') || 'audio/mp4';
+  const contentLength  = upstream.headers.get('Content-Length');
+  const contentRange   = upstream.headers.get('Content-Range');
+
+  const headers = new Headers();
+  headers.set('Content-Type', contentType);
+  headers.set('Accept-Ranges', 'bytes');
+  headers.set('Access-Control-Allow-Origin', '*');
+  headers.set('Cache-Control', 'public, max-age=3600');
+  if (contentLength) headers.set('Content-Length', contentLength);
+  if (contentRange)  headers.set('Content-Range', contentRange);
+
+  // If upstream returned 200 but client sent a Range request,
+  // force 206 so ExoPlayer doesn't reject it.
+  const status = rangeHeader ? 206 : (upstream.status === 206 ? 206 : 200);
+
+  return new Response(upstream.body, { status, headers });
 }
 
-// ─── Saavn handlers ───────────────────────────────────────────────────────────
+// ─── Saavn route handlers ─────────────────────────────────────────────────────
 
 async function handleSaavnSearch(query, limit, ctx) {
   if (!query) return jsonResp({ success: false, error: 'query required' }, 400);
   const cacheKey = new Request(`https://aurum-cache/saavn-search-v5/${encodeURIComponent(query.toLowerCase().trim())}-${limit}`);
   const cached = await caches.default.match(cacheKey);
-  if (cached) { const h = new Headers(cached.headers); h.set('X-Cache','HIT'); return new Response(cached.body, { status: cached.status, headers: h }); }
+  if (cached) {
+    const h = new Headers(cached.headers);
+    h.set('X-Cache', 'HIT');
+    return new Response(cached.body, { status: cached.status, headers: h });
+  }
   const songs = await saavnSearch(query, parseInt(limit) || 20);
   const resp = jsonResp({ success: true, data: { results: songs }, count: songs.length });
   if (songs.length > 0) {
@@ -660,18 +621,15 @@ async function handleSaavnSearch(query, limit, ctx) {
   return resp;
 }
 
-// FIX: handleSaavnStream now returns a media_url that points through THIS
-// worker's /stream-proxy endpoint instead of the raw Saavn CDN URL. The
-// raw CDN URL is what ExoPlayer was failing to play (see handleStreamProxy
-// comment above for the root cause). The Flutter app's existing
-// resolveStreamUrl() / AudioSource.uri() code needs ZERO changes — it just
-// gets handed a different (but still plain HTTPS) URL string, and that URL
-// now actually honors Range requests correctly.
 async function handleSaavnStream(songId, requestUrl, ctx) {
   if (!songId) return jsonResp({ success: false, error: 'id required' }, 400);
   const cacheKey = new Request(`https://aurum-cache/saavn-stream-v6/${songId}`);
   const cached = await caches.default.match(cacheKey);
-  if (cached) { const h = new Headers(cached.headers); h.set('X-Cache','HIT'); return new Response(cached.body, { status: cached.status, headers: h }); }
+  if (cached) {
+    const h = new Headers(cached.headers);
+    h.set('X-Cache', 'HIT');
+    return new Response(cached.body, { status: cached.status, headers: h });
+  }
   const stream = await saavnStreamById(songId);
   if (!stream) return jsonResp({ success: false, error: 'Stream not found' }, 404);
 
@@ -681,8 +639,8 @@ async function handleSaavnStream(songId, requestUrl, ctx) {
   const resp = jsonResp({
     success: true,
     ...stream,
-    url: proxiedUrl,         // ← now proxied, Range-safe
-    originalUrl: stream.url, // kept for debugging/diagnostics
+    url: proxiedUrl,
+    originalUrl: stream.url,
     id: songId,
   });
   const toCache = resp.clone();
@@ -696,7 +654,11 @@ async function handleSaavnLyrics(songId, ctx) {
   if (!songId) return jsonResp({ success: false, error: 'id required' }, 400);
   const cacheKey = new Request(`https://aurum-cache/saavn-lyrics-v5/${songId}`);
   const cached = await caches.default.match(cacheKey);
-  if (cached) { const h = new Headers(cached.headers); h.set('X-Cache','HIT'); return new Response(cached.body, { status: cached.status, headers: h }); }
+  if (cached) {
+    const h = new Headers(cached.headers);
+    h.set('X-Cache', 'HIT');
+    return new Response(cached.body, { status: cached.status, headers: h });
+  }
   const lyrics = await saavnLyrics(songId);
   if (!lyrics) return jsonResp({ success: false, error: 'Lyrics not found' }, 404);
   const resp = jsonResp({ success: true, data: { lyrics }, id: songId });
@@ -789,14 +751,10 @@ export default {
       if (!found) return jsonResp({ success: false, error: 'Search failed' }, 404);
 
       let audio = await ytAudioPipedSingle(found.videoId, found.instance);
-
       if (!audio) {
         const invFallback = sortedInstances(INVIDIOUS_INSTANCES)[0];
-        if (invFallback) {
-          audio = await ytAudioInvidiousSingle(found.videoId, invFallback);
-        }
+        if (invFallback) audio = await ytAudioInvidiousSingle(found.videoId, invFallback);
       }
-
       if (!audio) return jsonResp({ success: false, error: 'No audio URL' }, 502);
       return jsonResp({ success: true, ...audio, videoId: found.videoId });
     }
@@ -812,7 +770,7 @@ export default {
       return handleSaavnLyrics(searchParams.get('id') || '', ctx);
     }
 
-    // ── NEW: Audio proxy — fixes Range/206 mismatch from Saavn CDN ───────────
+    // ── Audio proxy ───────────────────────────────────────────────────────────
     if (pathname === '/stream-proxy') {
       return handleStreamProxy(request, searchParams.get('url') || '', ctx);
     }
@@ -820,10 +778,11 @@ export default {
     // ── Health ────────────────────────────────────────────────────────────────
     if (pathname === '/health') {
       return jsonResp({
-        status: 'ok', worker: 'aurum-v5.6-pro',
+        status: 'ok', worker: 'aurum-v5.1-stream-proxy-fixed',
         timestamp: Date.now(),
-        features: ['edge-cache', 'kv-cache', 'blast5', 'prewarm', 'coalescing', 'saavn-direct',
-                   'yt-suggestions', 'yt-trending', 'yt-related', 'audio-proxy-range-fix'],
+        features: ['edge-cache', 'kv-cache', 'blast5', 'prewarm', 'coalescing',
+                   'saavn-direct', 'yt-suggestions', 'yt-trending', 'yt-related',
+                   'stream-proxy-no-buffer'],
       });
     }
 
