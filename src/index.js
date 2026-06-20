@@ -542,13 +542,20 @@ async function handleYtRelated(videoId, ctx) {
 // AUDIO PROXY — fixes ExoPlayer "Source error code=0" on Saavn CDN streams.
 //
 // ROOT CAUSE: Saavn/Azure CDN advertises "Accept-Ranges: bytes" but silently
-// IGNORES the Range header and returns 200 + full body. ExoPlayer expects
-// 206 Partial Content — getting 200 back triggers "Source error" (code=0).
+// IGNORES the Range header and returns 200 + full body. The PREVIOUS version
+// of this function force-set status=206 whenever the CLIENT sent a Range
+// header — even when the upstream actually replied 200 with no Content-Range
+// at all. That produced an invalid HTTP response: status 206 with no
+// Content-Range header. Browsers silently tolerate this; ExoPlayer's
+// DefaultHttpDataSource does NOT, and throws a generic "Source error" (code=0)
+// — exactly the symptom seen in app diagnostics where Worker/Saavn resolve
+// succeeded but the in-app playback test still failed.
 //
-// FIX: Stream the response directly from upstream, forwarding the Range header.
-// We force status=206 and set correct Content-Range headers so ExoPlayer is
-// satisfied. No buffering — the response body streams through immediately,
-// so there's no memory limit issue.
+// FIX: only ever report 206 when the upstream genuinely returned 206 WITH a
+// real Content-Range header. Otherwise pass through the upstream's true
+// status (200 + full body), so ExoPlayer treats it as a normal full-content
+// response instead of a malformed partial one. Streaming still happens
+// directly from upstream.body with no buffering — no memory limit issue.
 // =============================================================================
 
 async function handleStreamProxy(request, encodedUrl, ctx) {
@@ -592,9 +599,13 @@ async function handleStreamProxy(request, encodedUrl, ctx) {
   if (contentLength) headers.set('Content-Length', contentLength);
   if (contentRange)  headers.set('Content-Range', contentRange);
 
-  // If upstream returned 200 but client sent a Range request,
-  // force 206 so ExoPlayer doesn't reject it.
-  const status = rangeHeader ? 206 : (upstream.status === 206 ? 206 : 200);
+  // FIX (was the root cause of "Source error code=0" in ExoPlayer):
+  // Only report 206 if the upstream genuinely sent BOTH status 206 AND a
+  // real Content-Range header. A 206 without Content-Range is invalid HTTP.
+  // If the CDN ignored the Range request and sent the full body (200),
+  // pass that through honestly as 200 — ExoPlayer plays it fine as a
+  // normal full-content response.
+  const status = (upstream.status === 206 && contentRange) ? 206 : 200;
 
   return new Response(upstream.body, { status, headers });
 }
