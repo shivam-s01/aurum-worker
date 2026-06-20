@@ -23,10 +23,6 @@ const CACHE_TTL = {
 const SAAVN_API = 'https://www.jiosaavn.com/api.php';
 
 // ─── Piped instances ──────────────────────────────────────────────────────────
-// FIX: 'https://piped.smnz.de' was a typo (no such host) — correct host is
-// 'pipedapi.smnz.de'. Also added kavin.rocks (official) + 3 more registered
-// instances for redundancy — previously if the listed instances were all
-// down/blocked, every YouTube resolve attempt failed with "No stream found".
 const PIPED_INSTANCES = [
   'https://pipedapi.kavin.rocks',
   'https://pipedapi.adminforge.de',
@@ -50,17 +46,6 @@ const INVIDIOUS_INSTANCES = [
   'https://iv.melmac.space',
 ];
 
-// =============================================================================
-// INNERTUBE — IOS client primary, ANDROID client fallback.
-// FIX: Google tightened PoToken/signature enforcement on the ANDROID client
-// through 2025-26, causing it to silently return empty streamingData on many
-// videos. The IOS client is currently the most reliable unauthenticated path
-// (no PoToken requirement as of this writing) so it now goes FIRST; ANDROID
-// is kept as a fallback in case IOS gets locked down too.
-// (Previously this file had this function defined TWICE — the second
-// definition silently overwrote the first, which is harmless here since both
-// were ANDROID-only, but it meant there was no real fallback. Consolidated.)
-// =============================================================================
 async function ytAudioInnertubeClient(videoId, clientName, clientVersion, extraContext, userAgent) {
   try {
     const resp = await fetch('https://www.youtube.com/youtubei/v1/player', {
@@ -97,9 +82,6 @@ async function ytAudioInnertubeClient(videoId, clientName, clientVersion, extraC
 }
 
 async function ytAudioInnertube(videoId) {
-  // Race IOS and ANDROID in parallel (not sequential) — keeps this function
-  // capped at ~6s instead of up to 12s, which matters since Stage 0 races
-  // this against Piped and we don't want to slow down the whole chain.
   const attempts = [
     ytAudioInnertubeClient(
       videoId, 'IOS', '19.45.4',
@@ -148,19 +130,11 @@ function sortedInstances(instances) {
   return [...instances].sort((a, b) => getScore(b) - getScore(a));
 }
 
-// =============================================================================
-// PRO FEATURE 1: KV PERSISTENT CACHE
-// Edge cache clears on worker redeploy. KV survives forever.
-// Means even after deploy, popular songs are still instant.
-// Usage: bind KV namespace "STREAM_CACHE" in wrangler.toml
-// =============================================================================
-
 async function kvGet(env, key) {
   try {
     if (!env?.STREAM_CACHE) return null;
     const val = await env.STREAM_CACHE.get(key, { type: 'json' });
     if (!val) return null;
-    // Check our own TTL (KV TTL isn't always precise)
     if (val.expiresAt && Date.now() > val.expiresAt) return null;
     return val.data;
   } catch (_) { return null; }
@@ -177,22 +151,7 @@ async function kvSet(env, key, data, ttlSeconds) {
   } catch (_) {}
 }
 
-// =============================================================================
-// PRO FEATURE 2: ULTRA-FAST MULTI-LAYER CACHE LOOKUP
-// Layer 1: CF Edge cache (0ms — in-memory at nearest POP)
-// Layer 2: KV store (5ms — persistent across restarts)
-// Layer 3: Resolve fresh (1-3s — only if both miss)
-// =============================================================================
-
 async function getYtStreamCached(videoId, env, ctx) {
-  // Layer 1: CF edge cache
-  // FIX: previously this returned the raw cached Response body directly.
-  // A raw cached stream's headers/shape can drift from what jsonResp
-  // produces (and binary stream re-wrapping has caused dropped fields in
-  // Flutter's dynamic decoder before). Now we parse the cached JSON and
-  // re-emit it through the same jsonResp helper every other path uses, so
-  // every response — cached or fresh — has byte-for-byte the same shape
-  // and headers.
   const edgeCacheKey = new Request(`https://aurum-cache/yt-stream-v5/${videoId}`);
   const edgeCached = await caches.default.match(edgeCacheKey);
   if (edgeCached) {
@@ -203,16 +162,12 @@ async function getYtStreamCached(videoId, env, ctx) {
       h.set('X-Cache', 'EDGE-HIT');
       h.set('X-Latency', '0');
       return new Response(resp.body, { status: resp.status, headers: h });
-    } catch (_) {
-      // Corrupt cache entry — treat as a miss, fall through to KV/fresh resolve.
-    }
+    } catch (_) {}
   }
 
-  // Layer 2: KV persistent cache
   const kvData = await kvGet(env, `yt:${videoId}`);
   if (kvData) {
     const resp = jsonResp({ success: true, ...kvData, videoId, fromKV: true });
-    // Re-populate edge cache from KV (so next request is 0ms again)
     ctx.waitUntil((async () => {
       const toCache = resp.clone();
       const ch = new Headers(toCache.headers);
@@ -225,27 +180,13 @@ async function getYtStreamCached(videoId, env, ctx) {
     return new Response(resp.body, { status: resp.status, headers: h });
   }
 
-  return null; // Both caches missed — need fresh resolve
+  return null;
 }
-
-// =============================================================================
-// PRO FEATURE 3: BLAST-5 PARALLEL RESOLUTION
-// Fire Piped x3 + Invidious x2 simultaneously.
-// Fastest one wins. Others cancelled.
-// Typical result: best instance responds in 300-800ms instead of 1-3s.
-// =============================================================================
 
 async function resolveYtStreamFast(videoId) {
   const ranked    = sortedInstances(PIPED_INSTANCES);
   const invRanked = sortedInstances(INVIDIOUS_INSTANCES);
 
-  // ── Stage 0: Race Innertube (IOS-first, ANDROID fallback) vs top Piped ────
-  // ytAudioInnertube() internally races the IOS and ANDROID Innertube clients
-  // against each other — IOS is currently the more reliable of the two since
-  // Google tightened PoToken/signature enforcement on the ANDROID client
-  // through 2025-26. That combined result is then raced here against the
-  // single best-scoring Piped instance, so we don't add latency if Innertube
-  // is slow on a given video — whichever source responds first wins.
   try {
     const stage0 = await Promise.any([
       ytAudioInnertube(videoId).then(r => r ?? Promise.reject('null')),
@@ -254,7 +195,6 @@ async function resolveYtStreamFast(videoId) {
     if (stage0) return stage0;
   } catch (_) {}
 
-  // ── Stage 1: Blast remaining Piped + top 2 Invidious in parallel ──────────
   const blastAttempts = [
     ...ranked.slice(1, 4).map(inst => ytAudioPipedSingle(videoId, inst)),
     ...invRanked.slice(0, 2).map(inst => ytAudioInvidiousSingle(videoId, inst)),
@@ -266,19 +206,6 @@ async function resolveYtStreamFast(videoId) {
     if (result) return result;
   } catch (_) {}
 
-  // ── Stage 2: Remaining instances — PARALLEL, not sequential ────────────────
-  // FIX: previously this looped sequentially with a 4s timeout PER instance,
-  // so worst case (10 dead instances) took 30-40s — way past the app's/curl's
-  // 10-15s timeout, causing "0 bytes received". Now all remaining instances
-  // are blasted in parallel (fastest wins) AND a hard 5s deadline is attached
-  // so this function never hangs past ~15s total (6s stage0 + 4s stage1 + 5s).
-  // FIX 2: invRanked instances were wrongly passed to ytAudioPipedSingle
-  // (Piped's URL shape), which can never work against an Invidious host.
-  // Verified clean mapping below: ranked.slice(4) → ytAudioPipedSingle (Piped
-  // instances only), invRanked.slice(2) → ytAudioInvidiousSingle (Invidious
-  // instances only). No cross-wiring, no shared closure state between the
-  // two .map() calls — each instance is passed directly as an argument, not
-  // captured from an outer loop variable, so there's no scope-leak risk.
   const stage2Attempts = [
     ...ranked.slice(4).map(inst => ytAudioPipedSingle(videoId, inst)),
     ...invRanked.slice(2).map(inst => ytAudioInvidiousSingle(videoId, inst)),
@@ -295,9 +222,6 @@ async function resolveYtStreamFast(videoId) {
 }
 
 async function ytAudioPipedSingle(videoId, instance) {
-  // Guard: a falsy/undefined instance would build an invalid fetch URL
-  // (e.g. "undefined/streams/...") and pollute instanceHealth with a bad
-  // Map key via recordFailure(). Bail out cleanly instead.
   if (!instance || !videoId) return null;
   const t0 = Date.now();
   try {
@@ -316,8 +240,6 @@ async function ytAudioPipedSingle(videoId, instance) {
 }
 
 async function ytAudioInvidiousSingle(videoId, instance) {
-  // Same guard as ytAudioPipedSingle — never let an undefined/empty instance
-  // reach fetch() or recordSuccess/recordFailure.
   if (!instance || !videoId) return null;
   const t0 = Date.now();
   try {
@@ -336,18 +258,9 @@ async function ytAudioInvidiousSingle(videoId, instance) {
   } catch (_) { recordFailure(instance); return null; }
 }
 
-// =============================================================================
-// PRO FEATURE 4: PREDICTIVE PRE-WARM
-// Flutter sends next song's videoId in advance via /api/prewarm
-// Worker resolves + caches it BEFORE user taps play.
-// When user taps → cache hit → 0ms!
-// Add this in Flutter: call prewarm when song is 30% done.
-// =============================================================================
-
 async function handlePrewarm(videoId, env, ctx) {
   if (!videoId) return jsonResp({ success: false, error: 'id required' }, 400);
 
-  // Check if already cached
   const edgeCacheKey = new Request(`https://aurum-cache/yt-stream-v5/${videoId}`);
   const edgeCached = await caches.default.match(edgeCacheKey);
   if (edgeCached) return jsonResp({ success: true, status: 'already_cached', videoId });
@@ -355,11 +268,9 @@ async function handlePrewarm(videoId, env, ctx) {
   const kvData = await kvGet(env, `yt:${videoId}`);
   if (kvData) return jsonResp({ success: true, status: 'kv_cached', videoId });
 
-  // Not cached — resolve in background, return immediately
   ctx.waitUntil((async () => {
     const audio = await resolveYtStreamFast(videoId);
     if (!audio) return;
-    // Store in both caches
     await kvSet(env, `yt:${videoId}`, audio, CACHE_TTL.prewarm);
     const resp = jsonResp({ success: true, ...audio, videoId });
     const toCache = resp.clone();
@@ -368,24 +279,17 @@ async function handlePrewarm(videoId, env, ctx) {
     await caches.default.put(edgeCacheKey, new Response(toCache.body, { status: toCache.status, headers: ch }));
   })());
 
-  // Instant return — pre-warm happening in background
   return jsonResp({ success: true, status: 'prewarming', videoId });
 }
 
-// =============================================================================
-// PRO FEATURE 5: REQUEST COALESCING
-// 100 users tap same song at same time = 1 upstream call, not 100.
-// =============================================================================
 const inflightStreams = new Map();
 
 async function handleYtStream(videoId, env, ctx) {
   if (!videoId) return jsonResp({ success: false, error: 'id required' }, 400);
 
-  // Multi-layer cache check
   const cached = await getYtStreamCached(videoId, env, ctx);
   if (cached) return cached;
 
-  // Request coalescing
   if (inflightStreams.has(videoId)) {
     const result = await inflightStreams.get(videoId);
     return result ? result.clone() : jsonResp({ success: false, error: 'No stream found' }, 502);
@@ -397,15 +301,12 @@ async function handleYtStream(videoId, env, ctx) {
 
     const resp = jsonResp({ success: true, ...audio, videoId });
 
-    // Store in BOTH edge cache + KV simultaneously
     const edgeCacheKey = new Request(`https://aurum-cache/yt-stream-v5/${videoId}`);
     ctx.waitUntil((async () => {
       const [edgeClone, kvClone] = [resp.clone(), resp.clone()];
-      // Edge cache
       const ch = new Headers(edgeClone.headers);
       ch.set('Cache-Control', `public, max-age=${CACHE_TTL.ytStream}, stale-while-revalidate=300`);
       await caches.default.put(edgeCacheKey, new Response(edgeClone.body, { status: edgeClone.status, headers: ch }));
-      // KV store
       await kvSet(env, `yt:${videoId}`, audio, CACHE_TTL.ytKV);
     })());
 
@@ -419,10 +320,6 @@ async function handleYtStream(videoId, env, ctx) {
   return result ? result.clone() : jsonResp({ success: false, error: 'No stream found' }, 502);
 }
 
-// =============================================================================
-// SAAVN DIRECT API
-// =============================================================================
-
 async function saavnSearch(query, limit = 20) {
   try {
     const url = `${SAAVN_API}?__call=autocomplete.get&_format=json&_marker=0&cc=in&includeMetaTags=0&query=${encodeURIComponent(query)}`;
@@ -434,9 +331,6 @@ async function saavnSearch(query, limit = 20) {
     const data = await resp.json();
     const songs = data?.songs?.data || [];
     if (songs.length > 0) {
-      // Fire stream URL resolution for top 5 results in parallel — embeds
-      // the 320kbps URL directly in search results so Flutter plays instantly
-      // without a second /song/ round-trip (saves 300-800ms on first play).
       const top = songs.slice(0, limit);
       const streamUrls = await Promise.allSettled(
         top.slice(0, 5).map(s => s.id ? saavnStreamById(s.id).catch(() => null) : Promise.resolve(null))
@@ -453,7 +347,6 @@ async function saavnSearch(query, limit = 20) {
           language: s.more_info?.language || 'hindi',
           year:     s.more_info?.year || null,
           source:   'saavn',
-          // Embedded stream URL — Flutter reads this directly, no /song/ call needed
           media_url: streamResult?.url || null,
           '320kbps': streamResult?.quality === '320kbps' ? streamResult?.url : null,
         };
@@ -489,10 +382,6 @@ async function saavnSearchFallback(query, limit = 20) {
 }
 
 async function saavnStreamById(songId) {
-  // Layer 1: Render API (has clean downloadUrl array).
-  // Strict 5s timeout — Render free-tier cold-starts can take 20-30s+, and we
-  // never want that to hang the whole worker response; fail fast and fall
-  // through to Layer 2 instead.
   try {
     const renderResp = await fetch(
       `https://jiosaavn-op-gits.onrender.com/api/songs?ids=${songId}`,
@@ -510,11 +399,8 @@ async function saavnStreamById(songId) {
         }
       }
     }
-  } catch (_) {
-    // Render timed out / cold-start / network error — fall through to Layer 2.
-  }
+  } catch (_) {}
 
-  // Layer 2: Direct JioSaavn API fallback
   try {
     const url = `${SAAVN_API}?__call=song.getDetails&cc=in&_marker=0%3F_marker%3D0&_format=json&pids=${songId}`;
     const resp = await fetch(url, {
@@ -553,16 +439,6 @@ function decodeHtml(str) {
     .replace(/&#039;/g,"'").replace(/&lt;/g,'<').replace(/&gt;/g,'>');
 }
 
-// =============================================================================
-// PREMIUM DISCOVERY SUITE — makes the app feel like a complete YouTube-Music-
-// style experience: live search suggestions, India trending feed, and
-// "related/next up" recommendations. Each is independently cached and never
-// touches the YT-stream-resolution code path above, so none of this can
-// regress the Stage 0/1/2 fallback chain, prewarm guards, or Saavn-first
-// search logic already in place.
-// =============================================================================
-
-// 1. Live search autocomplete suggestions (Google's own YT suggest endpoint)
 async function handleYtSuggestions(query, ctx) {
   if (!query) return jsonResp([]);
   const cacheKey = new Request(`https://aurum-cache/yt-suggest/${encodeURIComponent(query.toLowerCase())}`);
@@ -588,8 +464,6 @@ async function handleYtSuggestions(query, ctx) {
   } catch (_) { return jsonResp([]); }
 }
 
-// 2. India trending feed — sourced from healthiest Piped instance, falls
-// through the ranked list rather than hardcoding one instance.
 async function handleYtTrending(ctx) {
   const cacheKey = new Request(`https://aurum-cache/yt-trending-v5`);
   const cached = await caches.default.match(cacheKey);
@@ -626,7 +500,6 @@ async function handleYtTrending(ctx) {
   return jsonResp({ success: false, error: 'Trending feed temporarily unavailable' }, 503);
 }
 
-// 3. "Up next" / related song recommendations for a given videoId.
 async function handleYtRelated(videoId, ctx) {
   if (!videoId) return jsonResp({ success: false, error: 'id required' }, 400);
   const cacheKey = new Request(`https://aurum-cache/yt-related/${videoId}`);
@@ -663,6 +536,112 @@ async function handleYtRelated(videoId, ctx) {
   return jsonResp({ success: false, error: 'No related content found' }, 404);
 }
 
+// =============================================================================
+// AUDIO PROXY — fixes ExoPlayer "Source error code=0" on Saavn CDN streams.
+//
+// ROOT CAUSE (confirmed via curl):
+//   curl -H "Range: bytes=0-1023" <saavncdn-url>
+//   → HTTP/1.1 200 OK   (should be 206 Partial Content)
+//   → Content-Length: 15091015   (full file size, not the sliced range)
+//
+// The Saavn/Azure CDN advertises "Accept-Ranges: bytes" but silently IGNORES
+// the Range header and returns the full body with a 200 status. ExoPlayer's
+// HTTP data source sends a Range request expecting 206 + a correctly-sized
+// Content-Length/Content-Range; getting 200 + full-length back instead is
+// exactly what triggers a generic ExoPlaybackException "Source error" (code=0)
+// — ExoPlayer treats the mismatched response as a malformed/untrustworthy
+// source and aborts rather than just reading the full body.
+//
+// FIX: this Worker proxies the audio. It fetches the FULL file from the
+// upstream CDN once (cached at the edge), then serves byte-range slices
+// itself with a correct 206 response — Range, Content-Range, Content-Length,
+// Accept-Ranges, Content-Type all set properly. ExoPlayer now talks to a
+// "CDN" (this Worker) that actually honors Range correctly.
+// =============================================================================
+
+async function handleStreamProxy(request, encodedUrl, ctx) {
+  if (!encodedUrl) return jsonResp({ success: false, error: 'url required' }, 400);
+
+  let upstreamUrl;
+  try {
+    upstreamUrl = decodeURIComponent(encodedUrl);
+    const host = new URL(upstreamUrl).hostname;
+    // Only ever proxy Saavn's own CDN — never an arbitrary attacker-supplied URL.
+    if (!host.endsWith('saavncdn.com')) {
+      return jsonResp({ success: false, error: 'host not allowed' }, 403);
+    }
+  } catch (_) {
+    return jsonResp({ success: false, error: 'invalid url' }, 400);
+  }
+
+  // Cache the FULL upstream file at the edge (keyed by URL, ignoring Range) —
+  // repeated seeks/replays of the same song are served entirely from cache,
+  // no re-fetch from Saavn.
+  const fullCacheKey = new Request(`https://aurum-cache/audio-proxy-full/${encodeURIComponent(upstreamUrl)}`);
+  let fullResp = await caches.default.match(fullCacheKey);
+
+  if (!fullResp) {
+    const upstream = await fetch(upstreamUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+      // Deliberately NOT forwarding the client's Range header upstream —
+      // upstream ignores it anyway (see comment above), so we always fetch
+      // the complete file once and slice it correctly ourselves.
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!upstream.ok) {
+      return jsonResp({ success: false, error: `upstream ${upstream.status}` }, 502);
+    }
+    const ch = new Headers();
+    ch.set('Content-Type', upstream.headers.get('Content-Type') || 'audio/mp4');
+    ch.set('Cache-Control', 'public, max-age=3600');
+    fullResp = new Response(upstream.body, { status: 200, headers: ch });
+    ctx.waitUntil(caches.default.put(fullCacheKey, fullResp.clone()));
+  }
+
+  const contentType = fullResp.headers.get('Content-Type') || 'audio/mp4';
+  const buf = await fullResp.arrayBuffer();
+  const totalLength = buf.byteLength;
+
+  const rangeHeader = request.headers.get('Range');
+  if (!rangeHeader) {
+    return new Response(buf, {
+      status: 200,
+      headers: {
+        'Content-Type': contentType,
+        'Content-Length': String(totalLength),
+        'Accept-Ranges': 'bytes',
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'public, max-age=3600',
+      },
+    });
+  }
+
+  const match = /bytes=(\d*)-(\d*)/.exec(rangeHeader);
+  let start = match && match[1] ? parseInt(match[1], 10) : 0;
+  let end   = match && match[2] ? parseInt(match[2], 10) : totalLength - 1;
+  if (Number.isNaN(start) || start < 0) start = 0;
+  if (Number.isNaN(end) || end >= totalLength) end = totalLength - 1;
+  if (start > end) {
+    return new Response(null, {
+      status: 416,
+      headers: { 'Content-Range': `bytes */${totalLength}`, 'Access-Control-Allow-Origin': '*' },
+    });
+  }
+
+  const slice = buf.slice(start, end + 1);
+  return new Response(slice, {
+    status: 206,
+    headers: {
+      'Content-Type': contentType,
+      'Content-Length': String(slice.byteLength),
+      'Content-Range': `bytes ${start}-${end}/${totalLength}`,
+      'Accept-Ranges': 'bytes',
+      'Access-Control-Allow-Origin': '*',
+      'Cache-Control': 'public, max-age=3600',
+    },
+  });
+}
+
 // ─── Saavn handlers ───────────────────────────────────────────────────────────
 
 async function handleSaavnSearch(query, limit, ctx) {
@@ -681,14 +660,31 @@ async function handleSaavnSearch(query, limit, ctx) {
   return resp;
 }
 
-async function handleSaavnStream(songId, ctx) {
+// FIX: handleSaavnStream now returns a media_url that points through THIS
+// worker's /stream-proxy endpoint instead of the raw Saavn CDN URL. The
+// raw CDN URL is what ExoPlayer was failing to play (see handleStreamProxy
+// comment above for the root cause). The Flutter app's existing
+// resolveStreamUrl() / AudioSource.uri() code needs ZERO changes — it just
+// gets handed a different (but still plain HTTPS) URL string, and that URL
+// now actually honors Range requests correctly.
+async function handleSaavnStream(songId, requestUrl, ctx) {
   if (!songId) return jsonResp({ success: false, error: 'id required' }, 400);
-  const cacheKey = new Request(`https://aurum-cache/saavn-stream-v5/${songId}`);
+  const cacheKey = new Request(`https://aurum-cache/saavn-stream-v6/${songId}`);
   const cached = await caches.default.match(cacheKey);
   if (cached) { const h = new Headers(cached.headers); h.set('X-Cache','HIT'); return new Response(cached.body, { status: cached.status, headers: h }); }
   const stream = await saavnStreamById(songId);
   if (!stream) return jsonResp({ success: false, error: 'Stream not found' }, 404);
-  const resp = jsonResp({ success: true, ...stream, id: songId });
+
+  const origin = new URL(requestUrl).origin;
+  const proxiedUrl = `${origin}/stream-proxy?url=${encodeURIComponent(stream.url)}`;
+
+  const resp = jsonResp({
+    success: true,
+    ...stream,
+    url: proxiedUrl,         // ← now proxied, Range-safe
+    originalUrl: stream.url, // kept for debugging/diagnostics
+    id: songId,
+  });
   const toCache = resp.clone();
   const ch = new Headers(toCache.headers);
   ch.set('Cache-Control', `public, max-age=${CACHE_TTL.song}`);
@@ -742,32 +738,21 @@ export default {
       });
     }
 
-    // ── YouTube stream (multi-layer cached, blast-5, coalesced) ──────────────
     if (pathname === '/api/yt-stream') {
       return handleYtStream(searchParams.get('id') || '', env, ctx);
     }
 
-    // ── PRO: Predictive pre-warm — call this 30% into current song ───────────
-    // Flutter: ApiService.prewarmYt(nextSong.id)
-    // Supports BOTH:
-    //   POST /api/prewarm  body: { "id": "videoId" }
-    //   GET  /api/prewarm?id=videoId
     if (pathname === '/api/prewarm') {
       let id = searchParams.get('id') || '';
       if (!id && request.method === 'POST') {
         try {
           const body = await request.json();
           id = (body && body.id) ? String(body.id) : '';
-        } catch (_) {
-          // Malformed/empty JSON body — fall through with empty id,
-          // handlePrewarm already returns a clean 400 for that case.
-        }
+        } catch (_) {}
       }
       return handlePrewarm(id, env, ctx);
     }
 
-    // ── PREMIUM DISCOVERY: suggestions / trending / related ──────────────────
-    // These are additive — pure read-only feeds, never touch stream resolution.
     if (pathname === '/api/yt-suggestions') {
       return handleYtSuggestions(searchParams.get('q') || '', ctx);
     }
@@ -778,7 +763,6 @@ export default {
       return handleYtRelated(searchParams.get('id') || '', ctx);
     }
 
-    // ── YouTube search ────────────────────────────────────────────────────────
     if (pathname === '/api/yt' || pathname === '/api/yt-search') {
       const query = searchParams.get('q') || '';
       if (!query) return jsonResp({ success: false, error: 'q required' }, 400);
@@ -804,21 +788,8 @@ export default {
       } catch (_) {}
       if (!found) return jsonResp({ success: false, error: 'Search failed' }, 404);
 
-      // Piped first (the instance that found this video is usually fastest
-      // for resolving its own stream too — same backend, already warm).
       let audio = await ytAudioPipedSingle(found.videoId, found.instance);
 
-      // FIX: previously this called
-      //   ytAudioInvidiousSingle(videoId, sortedInstances(INVIDIOUS_INSTANCES)[0])
-      // with no guard — if INVIDIOUS_INSTANCES were ever empty (or every
-      // instance had a 0 health score after recent failures), `[0]` is
-      // `undefined`. That undefined would flow into ytAudioInvidiousSingle's
-      // fetch() as `${instance}/api/v1/videos/...` → `undefined/api/v1/...`,
-      // an invalid URL, AND into recordSuccess/recordFailure as a Map key of
-      // `undefined` — not a hard crash (Map allows undefined keys, fetch
-      // throws and is caught), but it silently pollutes instance-health
-      // tracking and wastes a network round trip on a request that can never
-      // succeed. Now we validate the instance string exists before calling.
       if (!audio) {
         const invFallback = sortedInstances(INVIDIOUS_INSTANCES)[0];
         if (invFallback) {
@@ -835,19 +806,24 @@ export default {
       return handleSaavnSearch(searchParams.get('query') || '', searchParams.get('limit') || '20', ctx);
     }
     if (pathname === '/song/') {
-      return handleSaavnStream(searchParams.get('id') || '', ctx);
+      return handleSaavnStream(searchParams.get('id') || '', request.url, ctx);
     }
     if (pathname === '/lyrics/') {
       return handleSaavnLyrics(searchParams.get('id') || '', ctx);
     }
 
+    // ── NEW: Audio proxy — fixes Range/206 mismatch from Saavn CDN ───────────
+    if (pathname === '/stream-proxy') {
+      return handleStreamProxy(request, searchParams.get('url') || '', ctx);
+    }
+
     // ── Health ────────────────────────────────────────────────────────────────
     if (pathname === '/health') {
       return jsonResp({
-        status: 'ok', worker: 'aurum-v5.5-pro',
+        status: 'ok', worker: 'aurum-v5.6-pro',
         timestamp: Date.now(),
         features: ['edge-cache', 'kv-cache', 'blast5', 'prewarm', 'coalescing', 'saavn-direct',
-                   'yt-suggestions', 'yt-trending', 'yt-related'],
+                   'yt-suggestions', 'yt-trending', 'yt-related', 'audio-proxy-range-fix'],
       });
     }
 
