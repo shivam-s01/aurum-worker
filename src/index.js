@@ -1,15 +1,7 @@
 // =============================================================================
-// Aurum Music — Cloudflare Worker v5.1 — PRO ULTRA-FAST YT
-// ZERO backend dependency — No Railway, No Render
-// YT songs play in 0.2-0.3 sec via:
-//   1. CF Edge Cache (instant — 0ms if cached at nearby POP)
-//   2. KV Store persistent cache (5ms — survives worker restarts)
-//   3. Predictive Pre-warm (next song cached BEFORE user taps)
-//   4. Blast-3 parallel resolution (fastest instance wins)
-//   5. Request coalescing (100 users = 1 upstream call)
+// Aurum Music — Cloudflare Worker v5.2 — DIRECT CDN (no proxy)
 // =============================================================================
 
-// ─── Cache TTLs ───────────────────────────────────────────────────────────────
 const CACHE_TTL = {
   ytStream:  3000,
   ytKV:      2700,
@@ -19,10 +11,8 @@ const CACHE_TTL = {
   prewarm:   2400,
 };
 
-// ─── Saavn API ────────────────────────────────────────────────────────────────
 const SAAVN_API = 'https://www.jiosaavn.com/api.php';
 
-// ─── Piped instances ──────────────────────────────────────────────────────────
 const PIPED_INSTANCES = [
   'https://pipedapi.kavin.rocks',
   'https://pipedapi.adminforge.de',
@@ -36,7 +26,6 @@ const PIPED_INSTANCES = [
   'https://pipedapi.leptons.xyz',
 ];
 
-// ─── Invidious instances ──────────────────────────────────────────────────────
 const INVIDIOUS_INSTANCES = [
   'https://invidious.adminforge.de',
   'https://yt.cdaut.de',
@@ -101,7 +90,6 @@ async function ytAudioInnertube(videoId) {
   }
 }
 
-// ─── Instance Health Scoring ──────────────────────────────────────────────────
 const instanceHealth = new Map();
 
 function getScore(instance) {
@@ -382,7 +370,6 @@ async function saavnSearchFallback(query, limit = 20) {
 }
 
 async function saavnStreamById(songId) {
-  // 1. Try onrender (rich downloadUrl array)
   try {
     const renderResp = await fetch(
       `https://jiosaavn-op-gits.onrender.com/api/songs?ids=${songId}`,
@@ -402,7 +389,6 @@ async function saavnStreamById(songId) {
     }
   } catch (_) {}
 
-  // 2. Direct JioSaavn API fallback
   try {
     const url = `${SAAVN_API}?__call=song.getDetails&cc=in&_marker=0%3F_marker%3D0&_format=json&pids=${songId}`;
     const resp = await fetch(url, {
@@ -539,78 +525,54 @@ async function handleYtRelated(videoId, ctx) {
 }
 
 // =============================================================================
-// AUDIO PROXY — fixes ExoPlayer "Source error code=0" on Saavn CDN streams.
+// SAAVN STREAM — v5.2 FIX: return direct CDN URL instead of proxying.
 //
-// ROOT CAUSE: Saavn/Azure CDN advertises "Accept-Ranges: bytes" but silently
-// IGNORES the Range header and returns 200 + full body. The PREVIOUS version
-// of this function force-set status=206 whenever the CLIENT sent a Range
-// header — even when the upstream actually replied 200 with no Content-Range
-// at all. That produced an invalid HTTP response: status 206 with no
-// Content-Range header. Browsers silently tolerate this; ExoPlayer's
-// DefaultHttpDataSource does NOT, and throws a generic "Source error" (code=0)
-// — exactly the symptom seen in app diagnostics where Worker/Saavn resolve
-// succeeded but the in-app playback test still failed.
+// ROOT CAUSE of "Source error code=0": ExoPlayer's DefaultHttpDataSource
+// was hitting the /stream-proxy endpoint which returned the audio stream
+// as a proxied response. Despite correct 200/206 status codes and headers,
+// ExoPlayer silently went to processingState=idle at position 0ms — meaning
+// the audio engine accepted the source but couldn't actually play it.
 //
-// FIX: only ever report 206 when the upstream genuinely returned 206 WITH a
-// real Content-Range header. Otherwise pass through the upstream's true
-// status (200 + full body), so ExoPlayer treats it as a normal full-content
-// response instead of a malformed partial one. Streaming still happens
-// directly from upstream.body with no buffering — no memory limit issue.
+// DIAGNOSIS: confirmed via in-app SnackBar error:
+//   "Silent fresh-start failure — setAudioSource appeared to succeed but
+//    processingState went idle at position 0ms (no exception thrown)"
+// curl confirmed: aac.saavncdn.com responds perfectly (200/206, audio/mp4,
+// Content-Length, Accept-Ranges) when hit directly.
+//
+// FIX: return stream.url (the direct saavncdn.com CDN URL) instead of
+// wrapping it in /stream-proxy. ExoPlayer hits the CDN directly — no
+// Cloudflare Worker middleman in the audio data path. The /stream-proxy
+// endpoint is kept for backward compat but is no longer used by the app.
 // =============================================================================
+async function handleSaavnStream(songId, requestUrl, ctx) {
+  if (!songId) return jsonResp({ success: false, error: 'id required' }, 400);
 
-async function handleStreamProxy(request, encodedUrl, ctx) {
-  if (!encodedUrl) return jsonResp({ success: false, error: 'url required' }, 400);
-
-  let upstreamUrl;
-  try {
-    upstreamUrl = decodeURIComponent(encodedUrl);
-    const host = new URL(upstreamUrl).hostname;
-    // Security: only proxy Saavn's own CDN
-    if (!host.endsWith('saavncdn.com')) {
-      return jsonResp({ success: false, error: 'host not allowed' }, 403);
-    }
-  } catch (_) {
-    return jsonResp({ success: false, error: 'invalid url' }, 400);
+  // Cache key bumped to v7 — v6 entries have proxied URLs, must not reuse them.
+  const cacheKey = new Request(`https://aurum-cache/saavn-stream-v7/${songId}`);
+  const cached = await caches.default.match(cacheKey);
+  if (cached) {
+    const h = new Headers(cached.headers);
+    h.set('X-Cache', 'HIT');
+    return new Response(cached.body, { status: cached.status, headers: h });
   }
 
-  const rangeHeader = request.headers.get('Range');
+  const stream = await saavnStreamById(songId);
+  if (!stream) return jsonResp({ success: false, error: 'Stream not found' }, 404);
 
-  const upstream = await fetch(upstreamUrl, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0',
-      ...(rangeHeader ? { 'Range': rangeHeader } : {}),
-    },
-    signal: AbortSignal.timeout(15000),
-  }).catch(() => null);
+  // KEY CHANGE: url = stream.url (direct CDN), not a /stream-proxy wrapper.
+  const resp = jsonResp({
+    success: true,
+    ...stream,
+    url: stream.url,
+    id: songId,
+  });
 
-  if (!upstream || (!upstream.ok && upstream.status !== 206)) {
-    return jsonResp({ success: false, error: `upstream ${upstream?.status ?? 'timeout'}` }, 502);
-  }
-
-  const contentType    = upstream.headers.get('Content-Type') || 'audio/mp4';
-  const contentLength  = upstream.headers.get('Content-Length');
-  const contentRange   = upstream.headers.get('Content-Range');
-
-  const headers = new Headers();
-  headers.set('Content-Type', contentType);
-  headers.set('Accept-Ranges', 'bytes');
-  headers.set('Access-Control-Allow-Origin', '*');
-  headers.set('Cache-Control', 'public, max-age=3600');
-  if (contentLength) headers.set('Content-Length', contentLength);
-  if (contentRange)  headers.set('Content-Range', contentRange);
-
-  // FIX (was the root cause of "Source error code=0" in ExoPlayer):
-  // Only report 206 if the upstream genuinely sent BOTH status 206 AND a
-  // real Content-Range header. A 206 without Content-Range is invalid HTTP.
-  // If the CDN ignored the Range request and sent the full body (200),
-  // pass that through honestly as 200 — ExoPlayer plays it fine as a
-  // normal full-content response.
-  const status = (upstream.status === 206 && contentRange) ? 206 : 200;
-
-  return new Response(upstream.body, { status, headers });
+  const toCache = resp.clone();
+  const ch = new Headers(toCache.headers);
+  ch.set('Cache-Control', `public, max-age=${CACHE_TTL.song}`);
+  ctx.waitUntil(caches.default.put(cacheKey, new Response(toCache.body, { status: toCache.status, headers: ch })));
+  return resp;
 }
-
-// ─── Saavn route handlers ─────────────────────────────────────────────────────
 
 async function handleSaavnSearch(query, limit, ctx) {
   if (!query) return jsonResp({ success: false, error: 'query required' }, 400);
@@ -629,35 +591,6 @@ async function handleSaavnSearch(query, limit, ctx) {
     ch.set('Cache-Control', `public, max-age=${CACHE_TTL.saavn}`);
     ctx.waitUntil(caches.default.put(cacheKey, new Response(toCache.body, { status: toCache.status, headers: ch })));
   }
-  return resp;
-}
-
-async function handleSaavnStream(songId, requestUrl, ctx) {
-  if (!songId) return jsonResp({ success: false, error: 'id required' }, 400);
-  const cacheKey = new Request(`https://aurum-cache/saavn-stream-v6/${songId}`);
-  const cached = await caches.default.match(cacheKey);
-  if (cached) {
-    const h = new Headers(cached.headers);
-    h.set('X-Cache', 'HIT');
-    return new Response(cached.body, { status: cached.status, headers: h });
-  }
-  const stream = await saavnStreamById(songId);
-  if (!stream) return jsonResp({ success: false, error: 'Stream not found' }, 404);
-
-  const origin = new URL(requestUrl).origin;
-  const proxiedUrl = `${origin}/stream-proxy?url=${encodeURIComponent(stream.url)}`;
-
-  const resp = jsonResp({
-    success: true,
-    ...stream,
-    url: proxiedUrl,
-    originalUrl: stream.url,
-    id: songId,
-  });
-  const toCache = resp.clone();
-  const ch = new Headers(toCache.headers);
-  ch.set('Cache-Control', `public, max-age=${CACHE_TTL.song}`);
-  ctx.waitUntil(caches.default.put(cacheKey, new Response(toCache.body, { status: toCache.status, headers: ch })));
   return resp;
 }
 
@@ -680,7 +613,40 @@ async function handleSaavnLyrics(songId, ctx) {
   return resp;
 }
 
-// ─── Helper ───────────────────────────────────────────────────────────────────
+async function handleStreamProxy(request, encodedUrl, ctx) {
+  if (!encodedUrl) return jsonResp({ success: false, error: 'url required' }, 400);
+  let upstreamUrl;
+  try {
+    upstreamUrl = decodeURIComponent(encodedUrl);
+    const host = new URL(upstreamUrl).hostname;
+    if (!host.endsWith('saavncdn.com')) {
+      return jsonResp({ success: false, error: 'host not allowed' }, 403);
+    }
+  } catch (_) {
+    return jsonResp({ success: false, error: 'invalid url' }, 400);
+  }
+  const rangeHeader = request.headers.get('Range');
+  const upstream = await fetch(upstreamUrl, {
+    headers: { 'User-Agent': 'Mozilla/5.0', ...(rangeHeader ? { 'Range': rangeHeader } : {}) },
+    signal: AbortSignal.timeout(15000),
+  }).catch(() => null);
+  if (!upstream || (!upstream.ok && upstream.status !== 206)) {
+    return jsonResp({ success: false, error: `upstream ${upstream?.status ?? 'timeout'}` }, 502);
+  }
+  const contentType   = upstream.headers.get('Content-Type') || 'audio/mp4';
+  const contentLength = upstream.headers.get('Content-Length');
+  const contentRange  = upstream.headers.get('Content-Range');
+  const headers = new Headers();
+  headers.set('Content-Type', contentType);
+  headers.set('Accept-Ranges', 'bytes');
+  headers.set('Access-Control-Allow-Origin', '*');
+  headers.set('Cache-Control', 'public, max-age=3600');
+  if (contentLength) headers.set('Content-Length', contentLength);
+  if (contentRange)  headers.set('Content-Range', contentRange);
+  const status = (upstream.status === 206 && contentRange) ? 206 : 200;
+  return new Response(upstream.body, { status, headers });
+}
+
 function jsonResp(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -691,10 +657,6 @@ function jsonResp(data, status = 200) {
     },
   });
 }
-
-// =============================================================================
-// MAIN HANDLER
-// =============================================================================
 
 export default {
   async fetch(request, env, ctx) {
@@ -711,30 +673,17 @@ export default {
       });
     }
 
-    if (pathname === '/api/yt-stream') {
-      return handleYtStream(searchParams.get('id') || '', env, ctx);
-    }
-
+    if (pathname === '/api/yt-stream') return handleYtStream(searchParams.get('id') || '', env, ctx);
     if (pathname === '/api/prewarm') {
       let id = searchParams.get('id') || '';
       if (!id && request.method === 'POST') {
-        try {
-          const body = await request.json();
-          id = (body && body.id) ? String(body.id) : '';
-        } catch (_) {}
+        try { const body = await request.json(); id = (body && body.id) ? String(body.id) : ''; } catch (_) {}
       }
       return handlePrewarm(id, env, ctx);
     }
-
-    if (pathname === '/api/yt-suggestions') {
-      return handleYtSuggestions(searchParams.get('q') || '', ctx);
-    }
-    if (pathname === '/api/yt-trending') {
-      return handleYtTrending(ctx);
-    }
-    if (pathname === '/api/yt-related') {
-      return handleYtRelated(searchParams.get('id') || '', ctx);
-    }
+    if (pathname === '/api/yt-suggestions') return handleYtSuggestions(searchParams.get('q') || '', ctx);
+    if (pathname === '/api/yt-trending')    return handleYtTrending(ctx);
+    if (pathname === '/api/yt-related')     return handleYtRelated(searchParams.get('id') || '', ctx);
 
     if (pathname === '/api/yt' || pathname === '/api/yt-search') {
       const query = searchParams.get('q') || '';
@@ -760,7 +709,6 @@ export default {
         }));
       } catch (_) {}
       if (!found) return jsonResp({ success: false, error: 'Search failed' }, 404);
-
       let audio = await ytAudioPipedSingle(found.videoId, found.instance);
       if (!audio) {
         const invFallback = sortedInstances(INVIDIOUS_INSTANCES)[0];
@@ -770,30 +718,17 @@ export default {
       return jsonResp({ success: true, ...audio, videoId: found.videoId });
     }
 
-    // ── Saavn endpoints ───────────────────────────────────────────────────────
-    if (pathname === '/result/') {
-      return handleSaavnSearch(searchParams.get('query') || '', searchParams.get('limit') || '20', ctx);
-    }
-    if (pathname === '/song/') {
-      return handleSaavnStream(searchParams.get('id') || '', request.url, ctx);
-    }
-    if (pathname === '/lyrics/') {
-      return handleSaavnLyrics(searchParams.get('id') || '', ctx);
-    }
+    if (pathname === '/result/') return handleSaavnSearch(searchParams.get('query') || '', searchParams.get('limit') || '20', ctx);
+    if (pathname === '/song/')   return handleSaavnStream(searchParams.get('id') || '', request.url, ctx);
+    if (pathname === '/lyrics/') return handleSaavnLyrics(searchParams.get('id') || '', ctx);
+    if (pathname === '/stream-proxy') return handleStreamProxy(request, searchParams.get('url') || '', ctx);
 
-    // ── Audio proxy ───────────────────────────────────────────────────────────
-    if (pathname === '/stream-proxy') {
-      return handleStreamProxy(request, searchParams.get('url') || '', ctx);
-    }
-
-    // ── Health ────────────────────────────────────────────────────────────────
     if (pathname === '/health') {
       return jsonResp({
-        status: 'ok', worker: 'aurum-v5.1-stream-proxy-fixed',
+        status: 'ok', worker: 'aurum-v5.2-direct-cdn',
         timestamp: Date.now(),
         features: ['edge-cache', 'kv-cache', 'blast5', 'prewarm', 'coalescing',
-                   'saavn-direct', 'yt-suggestions', 'yt-trending', 'yt-related',
-                   'stream-proxy-no-buffer'],
+                   'saavn-direct-cdn', 'yt-suggestions', 'yt-trending', 'yt-related'],
       });
     }
 
