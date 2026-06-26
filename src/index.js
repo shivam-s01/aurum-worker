@@ -524,30 +524,9 @@ async function handleYtRelated(videoId, ctx) {
   return jsonResp({ success: false, error: 'No related content found' }, 404);
 }
 
-// =============================================================================
-// SAAVN STREAM — v5.2 FIX: return direct CDN URL instead of proxying.
-//
-// ROOT CAUSE of "Source error code=0": ExoPlayer's DefaultHttpDataSource
-// was hitting the /stream-proxy endpoint which returned the audio stream
-// as a proxied response. Despite correct 200/206 status codes and headers,
-// ExoPlayer silently went to processingState=idle at position 0ms — meaning
-// the audio engine accepted the source but couldn't actually play it.
-//
-// DIAGNOSIS: confirmed via in-app SnackBar error:
-//   "Silent fresh-start failure — setAudioSource appeared to succeed but
-//    processingState went idle at position 0ms (no exception thrown)"
-// curl confirmed: aac.saavncdn.com responds perfectly (200/206, audio/mp4,
-// Content-Length, Accept-Ranges) when hit directly.
-//
-// FIX: return stream.url (the direct saavncdn.com CDN URL) instead of
-// wrapping it in /stream-proxy. ExoPlayer hits the CDN directly — no
-// Cloudflare Worker middleman in the audio data path. The /stream-proxy
-// endpoint is kept for backward compat but is no longer used by the app.
-// =============================================================================
 async function handleSaavnStream(songId, requestUrl, ctx) {
   if (!songId) return jsonResp({ success: false, error: 'id required' }, 400);
 
-  // Cache key bumped to v7 — v6 entries have proxied URLs, must not reuse them.
   const cacheKey = new Request(`https://aurum-cache/saavn-stream-v7/${songId}`);
   const cached = await caches.default.match(cacheKey);
   if (cached) {
@@ -559,7 +538,6 @@ async function handleSaavnStream(songId, requestUrl, ctx) {
   const stream = await saavnStreamById(songId);
   if (!stream) return jsonResp({ success: false, error: 'Stream not found' }, 404);
 
-  // KEY CHANGE: url = stream.url (direct CDN), not a /stream-proxy wrapper.
   const resp = jsonResp({
     success: true,
     ...stream,
@@ -674,6 +652,91 @@ export default {
     }
 
     if (pathname === '/api/yt-stream') return handleYtStream(searchParams.get('id') || '', env, ctx);
+
+    // ─── TEMPORARY DEBUG ENDPOINT ───────────────────────────────────────────
+    // Tests every resolution stage (Innertube IOS, Innertube ANDROID, every
+    // Piped instance, every Invidious instance) INDIVIDUALLY and reports
+    // exact status/error for each — so we know precisely which layer is
+    // broken instead of just seeing the final "No stream found".
+    // Remove this block once the root cause is found and fixed.
+    if (pathname === '/api/debug-yt') {
+      const videoId = searchParams.get('id') || 'dQw4w9WgXcQ';
+      const report = {};
+
+      try {
+        const t0 = Date.now();
+        const r = await ytAudioInnertubeClient(
+          videoId, 'IOS', '19.45.4',
+          { deviceModel: 'iPhone16,2', osVersion: '18.1', osName: 'iPhone' },
+          'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1 like Mac OS X)'
+        );
+        report.innertube_ios = { ok: !!r, ms: Date.now() - t0, result: r };
+      } catch (e) {
+        report.innertube_ios = { ok: false, error: String(e) };
+      }
+
+      try {
+        const t0 = Date.now();
+        const r = await ytAudioInnertubeClient(
+          videoId, 'ANDROID', '19.09.37',
+          { androidSdkVersion: 30 },
+          'com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip'
+        );
+        report.innertube_android = { ok: !!r, ms: Date.now() - t0, result: r };
+      } catch (e) {
+        report.innertube_android = { ok: false, error: String(e) };
+      }
+
+      report.piped = [];
+      for (const inst of PIPED_INSTANCES) {
+        const t0 = Date.now();
+        try {
+          const resp = await fetch(`${inst}/streams/${videoId}`, {
+            headers: { 'User-Agent': 'Mozilla/5.0' },
+            signal: AbortSignal.timeout(5000),
+          });
+          const status = resp.status;
+          let streamCount = null;
+          let bodySnippet = null;
+          if (resp.ok) {
+            const data = await resp.json();
+            streamCount = (data.audioStreams || []).length;
+          } else {
+            bodySnippet = (await resp.text()).slice(0, 150);
+          }
+          report.piped.push({ instance: inst, status, ms: Date.now() - t0, audioStreams: streamCount, body: bodySnippet });
+        } catch (e) {
+          report.piped.push({ instance: inst, error: String(e), ms: Date.now() - t0 });
+        }
+      }
+
+      report.invidious = [];
+      for (const inst of INVIDIOUS_INSTANCES) {
+        const t0 = Date.now();
+        try {
+          const resp = await fetch(`${inst}/api/v1/videos/${videoId}`, {
+            headers: { 'User-Agent': 'Mozilla/5.0' },
+            signal: AbortSignal.timeout(5000),
+          });
+          const status = resp.status;
+          let formatCount = null;
+          let bodySnippet = null;
+          if (resp.ok) {
+            const data = await resp.json();
+            formatCount = (data.adaptiveFormats || []).length;
+          } else {
+            bodySnippet = (await resp.text()).slice(0, 150);
+          }
+          report.invidious.push({ instance: inst, status, ms: Date.now() - t0, adaptiveFormats: formatCount, body: bodySnippet });
+        } catch (e) {
+          report.invidious.push({ instance: inst, error: String(e), ms: Date.now() - t0 });
+        }
+      }
+
+      return jsonResp({ success: true, videoId, report });
+    }
+    // ─── END TEMPORARY DEBUG ENDPOINT ───────────────────────────────────────
+
     if (pathname === '/api/prewarm') {
       let id = searchParams.get('id') || '';
       if (!id && request.method === 'POST') {
