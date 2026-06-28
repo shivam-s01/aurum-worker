@@ -24,12 +24,14 @@
 // =============================================================================
 
 const CACHE_TTL = {
-  ytStream:  3000,   // 50 min edge cache
-  ytKV:      2700,   // 45 min KV
-  saavn:     120,
-  song:      300,
-  lyrics:    600,
-  prewarm:   2400,
+  ytStream:    3000,   // 50 min edge cache
+  ytKV:        2700,   // 45 min KV
+  saavn:       120,
+  saavnStream: 1800,   // 30 min edge cache for resolved Saavn stream URLs
+  saavnKV:     1500,   // 25 min KV
+  song:        300,
+  lyrics:      600,
+  prewarm:     2400,
 };
 
 const SAAVN_API = 'https://www.jiosaavn.com/api.php';
@@ -319,15 +321,25 @@ async function resolveYtStreamFast(videoId) {
   const ranked    = sortedInstances(PIPED_INSTANCES);
   const invRanked = sortedInstances(INVIDIOUS_INSTANCES);
 
+  // Wrap candidate URLs with a quick liveness check before accepting them.
+  // Prevents handing back expired/IP-locked googlevideo URLs that resolve
+  // "successfully" but go idle@0ms in ExoPlayer (silent fresh-start failure).
+  async function validated(p) {
+    const r = await p;
+    if (!r || !r.url) return null;
+    const ok = await isUrlAlive(r.url);
+    return ok ? r : null;
+  }
+
   // ── STAGE 1+2+3 RACE: All innertube clients simultaneously ───────────────
   // android_sdkless first (most reliable 2026), ios_downgraded, web_embedded
   // Race them all at once — typically 1-3s on warm CF edge
   const innertubeRace = Promise.any([
-    ytAndroidSdkless(videoId).then(r => r ?? Promise.reject('null')),
-    ytIosDowngraded(videoId).then(r => r ?? Promise.reject('null')),
-    ytWebEmbedded(videoId).then(r => r ?? Promise.reject('null')),
+    validated(ytAndroidSdkless(videoId)).then(r => r ?? Promise.reject('null')),
+    validated(ytIosDowngraded(videoId)).then(r => r ?? Promise.reject('null')),
+    validated(ytWebEmbedded(videoId)).then(r => r ?? Promise.reject('null')),
     // Also race with best Piped instance (often fast)
-    ytAudioPipedSingle(videoId, ranked[0]).then(r => r ?? Promise.reject('null')),
+    validated(ytAudioPipedSingle(videoId, ranked[0])).then(r => r ?? Promise.reject('null')),
   ]).catch(() => null);
 
   const result1 = await innertubeRace;
@@ -340,7 +352,7 @@ async function resolveYtStreamFast(videoId) {
   ];
   try {
     const result2 = await Promise.any(
-      blastAttempts.map(p => p.then(r => r ?? Promise.reject('null')))
+      blastAttempts.map(p => validated(p).then(r => r ?? Promise.reject('null')))
     );
     if (result2) return result2;
   } catch (_) {}
@@ -348,14 +360,38 @@ async function resolveYtStreamFast(videoId) {
   // ── STAGE 5: Last resort — legacy clients + fresh Piped retry ────────────
   try {
     const result3 = await Promise.any([
-      ytLegacyIos(videoId).then(r => r ?? Promise.reject('null')),
-      ytAudioPipedSingle(videoId, ranked[1] || ranked[0]).then(r => r ?? Promise.reject('null')),
-      ytAudioInvidiousSingle(videoId, invRanked[0]).then(r => r ?? Promise.reject('null')),
+      validated(ytLegacyIos(videoId)).then(r => r ?? Promise.reject('null')),
+      validated(ytAudioPipedSingle(videoId, ranked[1] || ranked[0])).then(r => r ?? Promise.reject('null')),
+      validated(ytAudioInvidiousSingle(videoId, invRanked[0])).then(r => r ?? Promise.reject('null')),
     ]);
     if (result3) return result3;
   } catch (_) {}
 
   return null;
+}
+
+// Quick liveness probe — HEAD first, fall back to ranged GET (some CDNs
+// reject HEAD). Short timeout so it doesn't blow up total resolve latency.
+async function isUrlAlive(url) {
+  try {
+    const head = await fetch(url, {
+      method: 'HEAD',
+      signal: AbortSignal.timeout(2500),
+    });
+    if (head.ok) return true;
+    if (head.status === 405 || head.status === 403) {
+      // Some CDNs disallow HEAD or need a byte-range — try a tiny ranged GET
+      const ranged = await fetch(url, {
+        method: 'GET',
+        headers: { Range: 'bytes=0-1023' },
+        signal: AbortSignal.timeout(2500),
+      });
+      return ranged.ok || ranged.status === 206;
+    }
+    return false;
+  } catch (_) {
+    return false;
+  }
 }
 
 // =============================================================================
@@ -391,27 +427,34 @@ async function getYtStreamCached(videoId, env, ctx) {
   if (edgeCached) {
     try {
       const data = await edgeCached.json();
-      const resp = jsonResp(data);
-      const h = new Headers(resp.headers);
-      h.set('X-Cache', 'EDGE-HIT');
-      h.set('X-Latency', '0');
-      return new Response(resp.body, { status: resp.status, headers: h });
+      if (data?.url && await isUrlAlive(data.url)) {
+        const resp = jsonResp(data);
+        const h = new Headers(resp.headers);
+        h.set('X-Cache', 'EDGE-HIT');
+        h.set('X-Latency', '0');
+        return new Response(resp.body, { status: resp.status, headers: h });
+      }
+      // stale/dead — fall through to re-resolve, also drop the bad edge entry
+      ctx.waitUntil(caches.default.delete(edgeCacheKey));
     } catch (_) {}
   }
 
   const kvData = await kvGet(env, `yt:${videoId}`);
   if (kvData) {
-    const resp = jsonResp({ success: true, ...kvData, videoId, fromKV: true });
-    ctx.waitUntil((async () => {
-      const toCache = resp.clone();
-      const ch = new Headers(toCache.headers);
-      ch.set('Cache-Control', `public, max-age=1800, stale-while-revalidate=600`);
-      await caches.default.put(edgeCacheKey, new Response(toCache.body, { status: toCache.status, headers: ch }));
-    })());
-    const h = new Headers(resp.headers);
-    h.set('X-Cache', 'KV-HIT');
-    h.set('X-Latency', '5');
-    return new Response(resp.body, { status: resp.status, headers: h });
+    if (kvData.url && await isUrlAlive(kvData.url)) {
+      const resp = jsonResp({ success: true, ...kvData, videoId, fromKV: true });
+      ctx.waitUntil((async () => {
+        const toCache = resp.clone();
+        const ch = new Headers(toCache.headers);
+        ch.set('Cache-Control', `public, max-age=1800, stale-while-revalidate=600`);
+        await caches.default.put(edgeCacheKey, new Response(toCache.body, { status: toCache.status, headers: ch }));
+      })());
+      const h = new Headers(resp.headers);
+      h.set('X-Cache', 'KV-HIT');
+      h.set('X-Latency', '5');
+      return new Response(resp.body, { status: resp.status, headers: h });
+    }
+    // stale/dead KV entry — let it fall through to fresh resolve below
   }
 
   return null;
@@ -486,8 +529,22 @@ async function handlePrewarm(videoId, env, ctx) {
 }
 
 // =============================================================================
-// Saavn helpers (unchanged from v5.2)
+// Saavn helpers — PREMIUM v2: full-coverage resolution, caching, validation
+//
+// Changes from v5.2:
+//  - Stream URLs now resolved for ALL search results (not just top 5) via
+//    a bounded-concurrency batch, so every song the user taps is playable —
+//    not just the first few.
+//  - saavnStreamById results are cached (KV + edge) so repeat plays/resumes
+//    don't re-hit JioSaavn's API every time.
+//  - Added a third independent mirror as fallback (render-api → official
+//    Saavn API → saavn.dev mirror), so one dead mirror doesn't kill playback.
+//  - All resolved URLs pass through isUrlAlive() before being trusted —
+//    same fix applied to the YouTube path, now applied here too.
 // =============================================================================
+
+const SAAVN_STREAM_CONCURRENCY = 6; // bounded parallel resolves per search call
+
 async function saavnSearch(query, limit = 20) {
   try {
     const url = `${SAAVN_API}?__call=autocomplete.get&_format=json&_marker=0&cc=in&includeMetaTags=0&query=${encodeURIComponent(query)}`;
@@ -500,11 +557,9 @@ async function saavnSearch(query, limit = 20) {
     const songs = data?.songs?.data || [];
     if (songs.length > 0) {
       const top = songs.slice(0, limit);
-      const streamUrls = await Promise.allSettled(
-        top.slice(0, 5).map(s => s.id ? saavnStreamById(s.id).catch(() => null) : Promise.resolve(null))
-      );
+      const streamResults = await resolveStreamsBatch(top.map(s => s.id));
       return top.map((s, i) => {
-        const streamResult = i < 5 ? (streamUrls[i].status === 'fulfilled' ? streamUrls[i].value : null) : null;
+        const streamResult = streamResults[i];
         return {
           id:       s.id,
           title:    decodeHtml(s.title || ''),
@@ -516,6 +571,7 @@ async function saavnSearch(query, limit = 20) {
           year:     s.more_info?.year || null,
           source:   'saavn',
           media_url: streamResult?.url || null,
+          quality:   streamResult?.quality || null,
           '320kbps': streamResult?.quality === '320kbps' ? streamResult?.url : null,
         };
       });
@@ -535,21 +591,93 @@ async function saavnSearchFallback(query, limit = 20) {
     });
     if (!resp.ok) return [];
     const data = await resp.json();
-    return (data?.results || []).slice(0, limit).map(s => ({
-      id:       s.id,
-      title:    decodeHtml(s.song || s.title || ''),
-      artist:   decodeHtml(s.primary_artists || s.singers || ''),
-      album:    decodeHtml(s.album || ''),
-      image:    (s.image || '').replace('150x150', '500x500'),
-      duration: s.duration || null,
-      language: s.language || 'hindi',
-      year:     s.year || null,
-      source:   'saavn',
-    }));
+    const results = (data?.results || []).slice(0, limit);
+    const streamResults = await resolveStreamsBatch(results.map(s => s.id));
+    return results.map((s, i) => {
+      const streamResult = streamResults[i];
+      return {
+        id:       s.id,
+        title:    decodeHtml(s.song || s.title || ''),
+        artist:   decodeHtml(s.primary_artists || s.singers || ''),
+        album:    decodeHtml(s.album || ''),
+        image:    (s.image || '').replace('150x150', '500x500'),
+        duration: s.duration || null,
+        language: s.language || 'hindi',
+        year:     s.year || null,
+        source:   'saavn',
+        media_url: streamResult?.url || null,
+        quality:   streamResult?.quality || null,
+      };
+    });
   } catch (_) { return []; }
 }
 
+// Resolves stream URLs for a list of song IDs with bounded concurrency,
+// so a 20-result search doesn't fire 20 simultaneous outbound requests.
+async function resolveStreamsBatch(ids) {
+  const results = new Array(ids.length).fill(null);
+  let cursor = 0;
+
+  async function worker() {
+    while (cursor < ids.length) {
+      const idx = cursor++;
+      const id = ids[idx];
+      if (!id) continue;
+      try {
+        results[idx] = await saavnStreamByIdCached(id);
+      } catch (_) {
+        results[idx] = null;
+      }
+    }
+  }
+
+  const workers = Array.from(
+    { length: Math.min(SAAVN_STREAM_CONCURRENCY, ids.length) },
+    () => worker()
+  );
+  await Promise.all(workers);
+  return results;
+}
+
+// Cached wrapper around saavnStreamById — checks edge+KV cache first,
+// validates the cached URL is still alive, falls back to fresh resolve.
+async function saavnStreamByIdCached(songId, env, ctx) {
+  // env/ctx are optional here since this is also called from search (no ctx
+  // available there) — caching is best-effort and silently skipped if absent.
+  if (env && ctx) {
+    const edgeCacheKey = new Request(`https://aurum-cache/saavn-stream/${songId}`);
+    const edgeCached = await caches.default.match(edgeCacheKey);
+    if (edgeCached) {
+      try {
+        const data = await edgeCached.json();
+        if (data?.url && await isUrlAlive(data.url)) return data;
+      } catch (_) {}
+    }
+    const kvData = await kvGet(env, `saavn:${songId}`);
+    if (kvData?.url && await isUrlAlive(kvData.url)) return kvData;
+  }
+
+  const fresh = await saavnStreamById(songId);
+  if (!fresh?.url) return null;
+
+  if (!(await isUrlAlive(fresh.url))) return null;
+
+  if (env && ctx) {
+    const edgeCacheKey = new Request(`https://aurum-cache/saavn-stream/${songId}`);
+    ctx.waitUntil((async () => {
+      const resp = jsonResp(fresh);
+      const h = new Headers(resp.headers);
+      h.set('Cache-Control', `public, max-age=${CACHE_TTL.saavnStream}, stale-while-revalidate=300`);
+      await caches.default.put(edgeCacheKey, new Response(resp.body, { status: resp.status, headers: h }));
+      await kvSet(env, `saavn:${songId}`, fresh, CACHE_TTL.saavnKV);
+    })());
+  }
+
+  return fresh;
+}
+
 async function saavnStreamById(songId) {
+  // Mirror 1: community render-api (fast, usually first to respond)
   try {
     const renderResp = await fetch(
       `https://jiosaavn-op-gits.onrender.com/api/songs?ids=${songId}`,
@@ -569,25 +697,47 @@ async function saavnStreamById(songId) {
     }
   } catch (_) {}
 
+  // Mirror 2: official JioSaavn API (slower, but most authoritative)
   try {
     const url = `${SAAVN_API}?__call=song.getDetails&cc=in&_marker=0%3F_marker%3D0&_format=json&pids=${songId}`;
     const resp = await fetch(url, {
       headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.jiosaavn.com/' },
       signal: AbortSignal.timeout(6000),
     });
-    if (!resp.ok) return null;
-    const data = await resp.json();
-    const songData = data?.[songId];
-    if (!songData) return null;
-    const downloads = songData.more_info?.['320kbps'] ? [
-      { quality: '320kbps', url: songData.more_info['320kbps'] }
-    ] : [];
-    for (const quality of ['320kbps', '160kbps', '96kbps', '48kbps']) {
-      const match = downloads.find(d => d.quality === quality && (d.url || d.link));
-      if (match) return { url: match.url || match.link, quality: match.quality, source: 'saavn' };
+    if (resp.ok) {
+      const data = await resp.json();
+      const songData = data?.[songId];
+      if (songData) {
+        const downloads = songData.more_info?.['320kbps'] ? [
+          { quality: '320kbps', url: songData.more_info['320kbps'] }
+        ] : [];
+        for (const quality of ['320kbps', '160kbps', '96kbps', '48kbps']) {
+          const match = downloads.find(d => d.quality === quality && (d.url || d.link));
+          if (match) return { url: match.url || match.link, quality: match.quality, source: 'saavn' };
+        }
+      }
     }
-    return null;
-  } catch (_) { return null; }
+  } catch (_) {}
+
+  // Mirror 3: secondary community mirror — independent codebase/host from
+  // Mirror 1, so a render.com outage doesn't take down both at once.
+  try {
+    const altResp = await fetch(
+      `https://saavn.dev/api/songs/${songId}`,
+      { signal: AbortSignal.timeout(5000) }
+    );
+    if (altResp.ok) {
+      const altData = await altResp.json();
+      const song = Array.isArray(altData?.data) ? altData.data[0] : altData?.data;
+      const downloads = song?.downloadUrl || [];
+      for (const quality of ['320kbps', '160kbps', '96kbps', '48kbps']) {
+        const match = downloads.find(d => (d.quality === quality) && d.url);
+        if (match) return { url: match.url, quality: match.quality, source: 'saavn' };
+      }
+    }
+  } catch (_) {}
+
+  return null;
 }
 
 async function saavnLyrics(songId) {
@@ -708,16 +858,23 @@ async function handleYtRelated(videoId, ctx) {
   return jsonResp({ success: false, error: 'No related content found' }, 404);
 }
 
-async function handleSaavnStream(songId, ctx) {
+async function handleSaavnStream(songId, env, ctx) {
   if (!songId) return jsonResp({ success: false, error: 'id required' }, 400);
-  const cacheKey = new Request(`https://aurum-cache/saavn-stream-v7/${songId}`);
+  const cacheKey = new Request(`https://aurum-cache/saavn-stream-v8/${songId}`);
   const cached = await caches.default.match(cacheKey);
   if (cached) {
-    const h = new Headers(cached.headers);
-    h.set('X-Cache', 'HIT');
-    return new Response(cached.body, { status: cached.status, headers: h });
+    try {
+      const data = await cached.clone().json();
+      if (data?.url && await isUrlAlive(data.url)) {
+        const h = new Headers(cached.headers);
+        h.set('X-Cache', 'HIT');
+        return new Response(cached.body, { status: cached.status, headers: h });
+      }
+      // stale/dead cached URL — drop it and fall through to fresh resolve
+      ctx.waitUntil(caches.default.delete(cacheKey));
+    } catch (_) {}
   }
-  const stream = await saavnStreamById(songId);
+  const stream = await saavnStreamByIdCached(songId, env, ctx);
   if (!stream) return jsonResp({ success: false, error: 'Stream not found' }, 404);
   const resp = jsonResp({ success: true, ...stream, url: stream.url, id: songId });
   const toCache = resp.clone();
@@ -961,7 +1118,7 @@ export default {
     if (pathname === '/api/yt' || pathname === '/api/yt-search') return handleYtSearch(searchParams.get('q') || '', ctx);
 
     if (pathname === '/result/')       return handleSaavnSearch(searchParams.get('query') || '', searchParams.get('limit') || '20', ctx);
-    if (pathname === '/song/')         return handleSaavnStream(searchParams.get('id') || '', ctx);
+    if (pathname === '/song/')         return handleSaavnStream(searchParams.get('id') || '', env, ctx);
     if (pathname === '/lyrics/')       return handleSaavnLyrics(searchParams.get('id') || '', ctx);
     if (pathname === '/stream-proxy')  return handleStreamProxy(request, searchParams.get('url') || '', ctx);
 
