@@ -24,14 +24,12 @@
 // =============================================================================
 
 const CACHE_TTL = {
-  ytStream:    3000,   // 50 min edge cache
-  ytKV:        2700,   // 45 min KV
-  saavn:       120,
-  saavnStream: 1800,   // 30 min edge cache for resolved Saavn stream URLs
-  saavnKV:     1500,   // 25 min KV
-  song:        300,
-  lyrics:      600,
-  prewarm:     2400,
+  ytStream:  3000,   // 50 min edge cache
+  ytKV:      2700,   // 45 min KV
+  saavn:     120,
+  song:      300,
+  lyrics:    600,
+  prewarm:   2400,
 };
 
 const SAAVN_API = 'https://www.jiosaavn.com/api.php';
@@ -529,22 +527,8 @@ async function handlePrewarm(videoId, env, ctx) {
 }
 
 // =============================================================================
-// Saavn helpers — PREMIUM v2: full-coverage resolution, caching, validation
-//
-// Changes from v5.2:
-//  - Stream URLs now resolved for ALL search results (not just top 5) via
-//    a bounded-concurrency batch, so every song the user taps is playable —
-//    not just the first few.
-//  - saavnStreamById results are cached (KV + edge) so repeat plays/resumes
-//    don't re-hit JioSaavn's API every time.
-//  - Added a third independent mirror as fallback (render-api → official
-//    Saavn API → saavn.dev mirror), so one dead mirror doesn't kill playback.
-//  - All resolved URLs pass through isUrlAlive() before being trusted —
-//    same fix applied to the YouTube path, now applied here too.
+// Saavn helpers (unchanged from v5.2)
 // =============================================================================
-
-const SAAVN_STREAM_CONCURRENCY = 6; // bounded parallel resolves per search call
-
 async function saavnSearch(query, limit = 20) {
   try {
     const url = `${SAAVN_API}?__call=autocomplete.get&_format=json&_marker=0&cc=in&includeMetaTags=0&query=${encodeURIComponent(query)}`;
@@ -557,9 +541,11 @@ async function saavnSearch(query, limit = 20) {
     const songs = data?.songs?.data || [];
     if (songs.length > 0) {
       const top = songs.slice(0, limit);
-      const streamResults = await resolveStreamsBatch(top.map(s => s.id));
+      const streamUrls = await Promise.allSettled(
+        top.slice(0, 5).map(s => s.id ? saavnStreamById(s.id).catch(() => null) : Promise.resolve(null))
+      );
       return top.map((s, i) => {
-        const streamResult = streamResults[i];
+        const streamResult = i < 5 ? (streamUrls[i].status === 'fulfilled' ? streamUrls[i].value : null) : null;
         return {
           id:       s.id,
           title:    decodeHtml(s.title || ''),
@@ -571,7 +557,6 @@ async function saavnSearch(query, limit = 20) {
           year:     s.more_info?.year || null,
           source:   'saavn',
           media_url: streamResult?.url || null,
-          quality:   streamResult?.quality || null,
           '320kbps': streamResult?.quality === '320kbps' ? streamResult?.url : null,
         };
       });
@@ -591,93 +576,21 @@ async function saavnSearchFallback(query, limit = 20) {
     });
     if (!resp.ok) return [];
     const data = await resp.json();
-    const results = (data?.results || []).slice(0, limit);
-    const streamResults = await resolveStreamsBatch(results.map(s => s.id));
-    return results.map((s, i) => {
-      const streamResult = streamResults[i];
-      return {
-        id:       s.id,
-        title:    decodeHtml(s.song || s.title || ''),
-        artist:   decodeHtml(s.primary_artists || s.singers || ''),
-        album:    decodeHtml(s.album || ''),
-        image:    (s.image || '').replace('150x150', '500x500'),
-        duration: s.duration || null,
-        language: s.language || 'hindi',
-        year:     s.year || null,
-        source:   'saavn',
-        media_url: streamResult?.url || null,
-        quality:   streamResult?.quality || null,
-      };
-    });
+    return (data?.results || []).slice(0, limit).map(s => ({
+      id:       s.id,
+      title:    decodeHtml(s.song || s.title || ''),
+      artist:   decodeHtml(s.primary_artists || s.singers || ''),
+      album:    decodeHtml(s.album || ''),
+      image:    (s.image || '').replace('150x150', '500x500'),
+      duration: s.duration || null,
+      language: s.language || 'hindi',
+      year:     s.year || null,
+      source:   'saavn',
+    }));
   } catch (_) { return []; }
 }
 
-// Resolves stream URLs for a list of song IDs with bounded concurrency,
-// so a 20-result search doesn't fire 20 simultaneous outbound requests.
-async function resolveStreamsBatch(ids) {
-  const results = new Array(ids.length).fill(null);
-  let cursor = 0;
-
-  async function worker() {
-    while (cursor < ids.length) {
-      const idx = cursor++;
-      const id = ids[idx];
-      if (!id) continue;
-      try {
-        results[idx] = await saavnStreamByIdCached(id);
-      } catch (_) {
-        results[idx] = null;
-      }
-    }
-  }
-
-  const workers = Array.from(
-    { length: Math.min(SAAVN_STREAM_CONCURRENCY, ids.length) },
-    () => worker()
-  );
-  await Promise.all(workers);
-  return results;
-}
-
-// Cached wrapper around saavnStreamById — checks edge+KV cache first,
-// validates the cached URL is still alive, falls back to fresh resolve.
-async function saavnStreamByIdCached(songId, env, ctx) {
-  // env/ctx are optional here since this is also called from search (no ctx
-  // available there) — caching is best-effort and silently skipped if absent.
-  if (env && ctx) {
-    const edgeCacheKey = new Request(`https://aurum-cache/saavn-stream/${songId}`);
-    const edgeCached = await caches.default.match(edgeCacheKey);
-    if (edgeCached) {
-      try {
-        const data = await edgeCached.json();
-        if (data?.url && await isUrlAlive(data.url)) return data;
-      } catch (_) {}
-    }
-    const kvData = await kvGet(env, `saavn:${songId}`);
-    if (kvData?.url && await isUrlAlive(kvData.url)) return kvData;
-  }
-
-  const fresh = await saavnStreamById(songId);
-  if (!fresh?.url) return null;
-
-  if (!(await isUrlAlive(fresh.url))) return null;
-
-  if (env && ctx) {
-    const edgeCacheKey = new Request(`https://aurum-cache/saavn-stream/${songId}`);
-    ctx.waitUntil((async () => {
-      const resp = jsonResp(fresh);
-      const h = new Headers(resp.headers);
-      h.set('Cache-Control', `public, max-age=${CACHE_TTL.saavnStream}, stale-while-revalidate=300`);
-      await caches.default.put(edgeCacheKey, new Response(resp.body, { status: resp.status, headers: h }));
-      await kvSet(env, `saavn:${songId}`, fresh, CACHE_TTL.saavnKV);
-    })());
-  }
-
-  return fresh;
-}
-
 async function saavnStreamById(songId) {
-  // Mirror 1: community render-api (fast, usually first to respond)
   try {
     const renderResp = await fetch(
       `https://jiosaavn-op-gits.onrender.com/api/songs?ids=${songId}`,
@@ -697,47 +610,25 @@ async function saavnStreamById(songId) {
     }
   } catch (_) {}
 
-  // Mirror 2: official JioSaavn API (slower, but most authoritative)
   try {
     const url = `${SAAVN_API}?__call=song.getDetails&cc=in&_marker=0%3F_marker%3D0&_format=json&pids=${songId}`;
     const resp = await fetch(url, {
       headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://www.jiosaavn.com/' },
       signal: AbortSignal.timeout(6000),
     });
-    if (resp.ok) {
-      const data = await resp.json();
-      const songData = data?.[songId];
-      if (songData) {
-        const downloads = songData.more_info?.['320kbps'] ? [
-          { quality: '320kbps', url: songData.more_info['320kbps'] }
-        ] : [];
-        for (const quality of ['320kbps', '160kbps', '96kbps', '48kbps']) {
-          const match = downloads.find(d => d.quality === quality && (d.url || d.link));
-          if (match) return { url: match.url || match.link, quality: match.quality, source: 'saavn' };
-        }
-      }
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    const songData = data?.[songId];
+    if (!songData) return null;
+    const downloads = songData.more_info?.['320kbps'] ? [
+      { quality: '320kbps', url: songData.more_info['320kbps'] }
+    ] : [];
+    for (const quality of ['320kbps', '160kbps', '96kbps', '48kbps']) {
+      const match = downloads.find(d => d.quality === quality && (d.url || d.link));
+      if (match) return { url: match.url || match.link, quality: match.quality, source: 'saavn' };
     }
-  } catch (_) {}
-
-  // Mirror 3: secondary community mirror — independent codebase/host from
-  // Mirror 1, so a render.com outage doesn't take down both at once.
-  try {
-    const altResp = await fetch(
-      `https://saavn.dev/api/songs/${songId}`,
-      { signal: AbortSignal.timeout(5000) }
-    );
-    if (altResp.ok) {
-      const altData = await altResp.json();
-      const song = Array.isArray(altData?.data) ? altData.data[0] : altData?.data;
-      const downloads = song?.downloadUrl || [];
-      for (const quality of ['320kbps', '160kbps', '96kbps', '48kbps']) {
-        const match = downloads.find(d => (d.quality === quality) && d.url);
-        if (match) return { url: match.url, quality: match.quality, source: 'saavn' };
-      }
-    }
-  } catch (_) {}
-
-  return null;
+    return null;
+  } catch (_) { return null; }
 }
 
 async function saavnLyrics(songId) {
@@ -858,23 +749,16 @@ async function handleYtRelated(videoId, ctx) {
   return jsonResp({ success: false, error: 'No related content found' }, 404);
 }
 
-async function handleSaavnStream(songId, env, ctx) {
+async function handleSaavnStream(songId, ctx) {
   if (!songId) return jsonResp({ success: false, error: 'id required' }, 400);
-  const cacheKey = new Request(`https://aurum-cache/saavn-stream-v8/${songId}`);
+  const cacheKey = new Request(`https://aurum-cache/saavn-stream-v7/${songId}`);
   const cached = await caches.default.match(cacheKey);
   if (cached) {
-    try {
-      const data = await cached.clone().json();
-      if (data?.url && await isUrlAlive(data.url)) {
-        const h = new Headers(cached.headers);
-        h.set('X-Cache', 'HIT');
-        return new Response(cached.body, { status: cached.status, headers: h });
-      }
-      // stale/dead cached URL — drop it and fall through to fresh resolve
-      ctx.waitUntil(caches.default.delete(cacheKey));
-    } catch (_) {}
+    const h = new Headers(cached.headers);
+    h.set('X-Cache', 'HIT');
+    return new Response(cached.body, { status: cached.status, headers: h });
   }
-  const stream = await saavnStreamByIdCached(songId, env, ctx);
+  const stream = await saavnStreamById(songId);
   if (!stream) return jsonResp({ success: false, error: 'Stream not found' }, 404);
   const resp = jsonResp({ success: true, ...stream, url: stream.url, id: songId });
   const toCache = resp.clone();
@@ -1085,6 +969,80 @@ function jsonResp(data, status = 200) {
   });
 }
 
+
+// =============================================================================
+// YT PROXY — pipes googlevideo bytes through Cloudflare edge
+// Googlevideo URLs are IP-locked to the resolving server's IP (Cloudflare).
+// Giving the raw URL to ExoPlayer fails because phone's IP != Cloudflare IP.
+// This endpoint resolves the video, then streams the bytes back to the phone
+// through Cloudflare — same IP that resolved = no IP mismatch.
+// =============================================================================
+async function handleYtProxy(videoId, request, env, ctx) {
+  if (!videoId) return new Response('id required', { status: 400 });
+
+  // Get the resolved audio URL (from cache or fresh resolve)
+  let audioUrl = null;
+
+  // Check KV cache first
+  const kvData = await kvGet(env, `yt:${videoId}`);
+  if (kvData?.url) {
+    audioUrl = kvData.url;
+  } else {
+    // Fresh resolve
+    const audio = await resolveYtStreamFast(videoId);
+    if (!audio?.url) return new Response('Could not resolve stream', { status: 502 });
+    audioUrl = audio.url;
+    // Cache it
+    ctx.waitUntil(kvSet(env, `yt:${videoId}`, audio, CACHE_TTL.ytKV));
+  }
+
+  // Proxy the audio bytes
+  const rangeHeader = request.headers.get('Range');
+  const upstream = await fetch(audioUrl, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36',
+      ...(rangeHeader ? { 'Range': rangeHeader } : {}),
+    },
+    signal: AbortSignal.timeout(30000),
+  }).catch(() => null);
+
+  if (!upstream || (!upstream.ok && upstream.status !== 206)) {
+    // URL expired — fresh resolve and retry once
+    const audio = await resolveYtStreamFast(videoId);
+    if (!audio?.url) return new Response('Stream unavailable', { status: 502 });
+    ctx.waitUntil(kvSet(env, `yt:${videoId}`, audio, CACHE_TTL.ytKV));
+    const retry = await fetch(audio.url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36',
+        ...(rangeHeader ? { 'Range': rangeHeader } : {}),
+      },
+      signal: AbortSignal.timeout(30000),
+    }).catch(() => null);
+    if (!retry || (!retry.ok && retry.status !== 206)) {
+      return new Response('Stream unavailable after retry', { status: 502 });
+    }
+    return proxyAudioResponse(retry, rangeHeader);
+  }
+
+  return proxyAudioResponse(upstream, rangeHeader);
+}
+
+function proxyAudioResponse(upstream, rangeHeader) {
+  const headers = new Headers();
+  headers.set('Content-Type', upstream.headers.get('Content-Type') || 'audio/mp4');
+  headers.set('Accept-Ranges', 'bytes');
+  headers.set('Access-Control-Allow-Origin', '*');
+  headers.set('Cache-Control', 'public, max-age=3600');
+  const contentLength = upstream.headers.get('Content-Length');
+  const contentRange  = upstream.headers.get('Content-Range');
+  if (contentLength) headers.set('Content-Length', contentLength);
+  if (contentRange)  headers.set('Content-Range', contentRange);
+  return new Response(upstream.body, {
+    status: upstream.status === 206 ? 206 : 200,
+    headers,
+  });
+}
+
 // =============================================================================
 // Main router
 // =============================================================================
@@ -1104,6 +1062,7 @@ export default {
     }
 
     if (pathname === '/api/yt-stream')      return handleYtStream(searchParams.get('id') || '', env, ctx);
+    if (pathname === '/api/yt-proxy')       return handleYtProxy(searchParams.get('id') || '', request, env, ctx);
     if (pathname === '/api/debug-yt')       return handleDebugYt(searchParams.get('id') || 'dQw4w9WgXcQ');
     if (pathname === '/api/prewarm') {
       let id = searchParams.get('id') || '';
@@ -1118,7 +1077,7 @@ export default {
     if (pathname === '/api/yt' || pathname === '/api/yt-search') return handleYtSearch(searchParams.get('q') || '', ctx);
 
     if (pathname === '/result/')       return handleSaavnSearch(searchParams.get('query') || '', searchParams.get('limit') || '20', ctx);
-    if (pathname === '/song/')         return handleSaavnStream(searchParams.get('id') || '', env, ctx);
+    if (pathname === '/song/')         return handleSaavnStream(searchParams.get('id') || '', ctx);
     if (pathname === '/lyrics/')       return handleSaavnLyrics(searchParams.get('id') || '', ctx);
     if (pathname === '/stream-proxy')  return handleStreamProxy(request, searchParams.get('url') || '', ctx);
 
