@@ -329,43 +329,25 @@ async function resolveYtStreamFast(videoId) {
     return ok ? r : null;
   }
 
-  // ── STAGE 1+2+3 RACE: All innertube clients simultaneously ───────────────
-  // android_sdkless first (most reliable 2026), ios_downgraded, web_embedded
-  // Race them all at once — typically 1-3s on warm CF edge
-  const innertubeRace = Promise.any([
-    validated(ytAndroidSdkless(videoId)).then(r => r ?? Promise.reject('null')),
-    validated(ytIosDowngraded(videoId)).then(r => r ?? Promise.reject('null')),
-    validated(ytWebEmbedded(videoId)).then(r => r ?? Promise.reject('null')),
-    // Also race with best Piped instance (often fast)
-    validated(ytAudioPipedSingle(videoId, ranked[0])).then(r => r ?? Promise.reject('null')),
-  ]).catch(() => null);
+  // ── COMBINED RACE: fire all stages at once instead of sequential
+  // waterfall (was Stage1 → wait fail → Stage4 → wait fail → Stage5,
+  // which could stack up to 15-20s+ on a bad client). Racing everything
+  // together means total latency = fastest working source, not sum of
+  // failed stages.
+  const allAttempts = [
+    validated(ytAndroidSdkless(videoId)),
+    validated(ytIosDowngraded(videoId)),
+    validated(ytWebEmbedded(videoId)),
+    validated(ytLegacyIos(videoId)),
+    ...ranked.map(inst => validated(ytAudioPipedSingle(videoId, inst))),
+    ...invRanked.map(inst => validated(ytAudioInvidiousSingle(videoId, inst))),
+  ].map(p => p.then(r => r ?? Promise.reject('null')).catch(e => Promise.reject(e)));
 
-  const result1 = await innertubeRace;
-  if (result1) return result1;
-
-  // ── STAGE 4: Blast race ALL Piped + Invidious simultaneously ─────────────
-  const blastAttempts = [
-    ...ranked.map(inst => ytAudioPipedSingle(videoId, inst)),
-    ...invRanked.map(inst => ytAudioInvidiousSingle(videoId, inst)),
-  ];
   try {
-    const result2 = await Promise.any(
-      blastAttempts.map(p => validated(p).then(r => r ?? Promise.reject('null')))
-    );
-    if (result2) return result2;
-  } catch (_) {}
-
-  // ── STAGE 5: Last resort — legacy clients + fresh Piped retry ────────────
-  try {
-    const result3 = await Promise.any([
-      validated(ytLegacyIos(videoId)).then(r => r ?? Promise.reject('null')),
-      validated(ytAudioPipedSingle(videoId, ranked[1] || ranked[0])).then(r => r ?? Promise.reject('null')),
-      validated(ytAudioInvidiousSingle(videoId, invRanked[0])).then(r => r ?? Promise.reject('null')),
-    ]);
-    if (result3) return result3;
-  } catch (_) {}
-
-  return null;
+    return await Promise.any(allAttempts);
+  } catch (_) {
+    return null;
+  }
 }
 
 // Quick liveness probe — HEAD first, fall back to ranged GET (some CDNs
@@ -438,21 +420,11 @@ async function getYtStreamCached(videoId, env, ctx) {
   }
 
   const kvData = await kvGet(env, `yt:${videoId}`);
-  if (kvData) {
-    if (kvData.url && await isUrlAlive(kvData.url)) {
-      const resp = jsonResp({ success: true, ...kvData, videoId, fromKV: true });
-      ctx.waitUntil((async () => {
-        const toCache = resp.clone();
-        const ch = new Headers(toCache.headers);
-        ch.set('Cache-Control', `public, max-age=1800, stale-while-revalidate=600`);
-        await caches.default.put(edgeCacheKey, new Response(toCache.body, { status: toCache.status, headers: ch }));
-      })());
-      const h = new Headers(resp.headers);
-      h.set('X-Cache', 'KV-HIT');
-      h.set('X-Latency', '5');
-      return new Response(resp.body, { status: resp.status, headers: h });
-    }
-    // stale/dead KV entry — let it fall through to fresh resolve below
+  if (kvData?.url) {
+    const resp = jsonResp({ success: true, ...kvData, videoId, fromKV: true });
+    const h = new Headers(resp.headers);
+    h.set('X-Cache', 'KV-HIT');
+    return new Response(resp.body, { status: resp.status, headers: h });
   }
 
   return null;
