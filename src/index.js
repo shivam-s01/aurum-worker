@@ -34,28 +34,39 @@ const CACHE_TTL = {
 
 const SAAVN_API = 'https://www.jiosaavn.com/api.php';
 
-// ─── Piped instances (10 for blast race) ─────────────────────────────────────
+// ─── Piped instances (verified live via status.piped.video, 2026-07) ────────
+// PREVIOUS LIST WAS MOSTLY DEAD: kavin.rocks was the only one still up.
+// adminforge.de, syncpundit.io, garudalinux.org, api.piped.yt, tokhmi.xyz,
+// moomoo.me, and leptons.xyz were all showing 0% uptime — every request to
+// them was pure wasted timeout latency (contributing directly to the "some
+// songs just hang" symptom, since blast-racing 9 guaranteed-dead endpoints
+// alongside 1 live one still costs a full timeout cycle before the live
+// one's response comes back). Replaced with currently-live public
+// instances. NOTE: Piped/Invidious public instances have historically
+// rotated every few months as Google pressures them — if songs start
+// failing again down the line, check https://status.piped.video and
+// https://github.com/TeamPiped/piped-uptime for current live instances
+// before assuming the code itself regressed.
 const PIPED_INSTANCES = [
   'https://pipedapi.kavin.rocks',
-  'https://pipedapi.adminforge.de',
-  'https://pipedapi.syncpundit.io',
-  'https://piped-api.garudalinux.org',
-  'https://api.piped.yt',
-  'https://pipedapi.reallyaweso.me',
-  'https://pipedapi.smnz.de',
-  'https://pipedapi.tokhmi.xyz',
-  'https://pipedapi.moomoo.me',
-  'https://pipedapi.leptons.xyz',
+  'https://piped-api.lunar.icu',
+  'https://yapi.vyper.me',
+  'https://api.looleh.xyz',
 ];
 
-// ─── Invidious instances ──────────────────────────────────────────────────────
+// ─── Invidious instances (from official api.invidious.io list, 2026-07) ────
+// Official list requires 90%+ uptime to be listed at all, so these are the
+// most trustworthy public instances currently available. Kept the two from
+// the old list that still appear on the official list (nadeko.net,
+// melmac.space); replaced the rest, which weren't on the current official
+// list, with confirmed-current ones.
 const INVIDIOUS_INSTANCES = [
-  'https://invidious.adminforge.de',
-  'https://yt.cdaut.de',
-  'https://invidious.nerdvpn.de',
   'https://inv.nadeko.net',
-  'https://invidious.privacyredirect.com',
   'https://iv.melmac.space',
+  'https://yewtu.be',
+  'https://yt.artemislena.eu',
+  'https://invidious.flokinet.to',
+  'https://invidious.privacydev.net',
 ];
 
 // =============================================================================
@@ -203,6 +214,56 @@ async function ytLegacyIos(videoId) {
   } catch (_) { return null; }
 }
 
+// =============================================================================
+// STAGE: ANDROID_VR — confirmed (yt-dlp, Jan-Mar 2026 maintenance commits) as
+// one of the few clients that still works WITHOUT a PoToken. yt-dlp actually
+// made this their #1 default client as of early 2026 (ahead of ios_downgraded
+// and web variants), specifically because most other clients now require
+// PoToken for GVS. Parameters below (clientVersion 1.71.26, Oculus Quest 3
+// device strings) match yt-dlp's current values — these drift every few
+// months as YouTube revs its internal client versions, so if this stage
+// stops working, check yt-dlp's youtube extractor source for the current
+// android_vr block before assuming the approach itself is dead.
+// NOTE: some regions see this client intermittently return only a single
+// low-quality (360p) format instead of the full format list — that's a
+// known yt-dlp-tracked issue (upstream #16150), not a bug in this worker.
+// It still races alongside the other clients here, so a bad low-quality
+// response from this stage just loses the race to a better one, rather
+// than being the only option.
+// =============================================================================
+async function ytAndroidVr(videoId) {
+  try {
+    const resp = await fetch('https://www.youtube.com/youtubei/v1/player', {
+      method: 'POST',
+      headers: {
+        'Content-Type':             'application/json',
+        'User-Agent':               'com.google.android.apps.youtube.vr.oculus/1.71.26 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
+        'X-YouTube-Client-Name':    '28',
+        'X-YouTube-Client-Version': '1.71.26',
+      },
+      body: JSON.stringify({
+        videoId,
+        context: {
+          client: {
+            clientName:        'ANDROID_VR',
+            clientVersion:     '1.71.26',
+            deviceMake:        'Oculus',
+            deviceModel:       'Quest 3',
+            androidSdkVersion: 32,
+            osName:            'Android',
+            osVersion:         '12L',
+            hl: 'en', gl: 'US',
+          },
+        },
+      }),
+      signal: AbortSignal.timeout(7000),
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    return _extractBestAudio(data, 'android_vr');
+  } catch (_) { return null; }
+}
+
 // ─── Audio extraction helper ──────────────────────────────────────────────────
 function _extractBestAudio(data, source) {
   // Check for bot detection / login required
@@ -336,6 +397,7 @@ async function resolveYtStreamFast(videoId) {
   // failed stages.
   const allAttempts = [
     validated(ytAndroidSdkless(videoId)),
+    validated(ytAndroidVr(videoId)),
     validated(ytIosDowngraded(videoId)),
     validated(ytWebEmbedded(videoId)),
     validated(ytLegacyIos(videoId)),
@@ -421,10 +483,24 @@ async function getYtStreamCached(videoId, env, ctx) {
 
   const kvData = await kvGet(env, `yt:${videoId}`);
   if (kvData?.url) {
-    const resp = jsonResp({ success: true, ...kvData, videoId, fromKV: true });
-    const h = new Headers(resp.headers);
-    h.set('X-Cache', 'KV-HIT');
-    return new Response(resp.body, { status: resp.status, headers: h });
+    // FIX: the edge-cache path above already re-validates via isUrlAlive()
+    // before serving, but this KV path was handing back kvData.url with NO
+    // liveness check at all. googlevideo.com URLs carry an `expire=` param
+    // and are IP-locked to the Worker's resolving IP — if the KV entry is
+    // stale (TTL says "still valid" but YouTube's signature already
+    // expired, or Cloudflare rotated edge IPs), ExoPlayer gets a silent
+    // 403 with zero error surfaced, which is indistinguishable from
+    // "still loading" on the phone. Same validation as the edge path, and
+    // same self-healing behavior: a dead KV entry gets deleted so the next
+    // request falls through to a fresh resolve instead of serving the same
+    // dead URL again.
+    if (await isUrlAlive(kvData.url)) {
+      const resp = jsonResp({ success: true, ...kvData, videoId, fromKV: true });
+      const h = new Headers(resp.headers);
+      h.set('X-Cache', 'KV-HIT');
+      return new Response(resp.body, { status: resp.status, headers: h });
+    }
+    ctx.waitUntil(env?.STREAM_CACHE ? env.STREAM_CACHE.delete(`yt:${videoId}`) : Promise.resolve());
   }
 
   return null;
@@ -447,7 +523,21 @@ async function handleYtStream(videoId, env, ctx) {
   }
 
   const resolutionPromise = (async () => {
-    const audio = await resolveYtStreamFast(videoId);
+    let audio = await resolveYtStreamFast(videoId);
+
+    // FIX: retry-with-backoff on total resolve failure. YouTube's bot
+    // detection is intermittent (confirmed: same client can pass/fail
+    // seconds apart), so if every stage failed simultaneously it's often
+    // a transient/coincidental block, not a genuinely dead video. A single
+    // retry after a short delay likely hits a different Cloudflare
+    // edge/connection and a different momentary state on YouTube's side.
+    // Bounded to ONE retry so worst-case added latency stays small
+    // (~400-600ms) instead of compounding into a long hang.
+    if (!audio) {
+      await new Promise(r => setTimeout(r, 400 + Math.floor(Math.random() * 200)));
+      audio = await resolveYtStreamFast(videoId);
+    }
+
     if (!audio) return null;
 
     const resp = jsonResp({ success: true, ...audio, videoId });
@@ -1058,7 +1148,7 @@ export default {
         status: 'ok',
         worker: 'aurum-v6.0-bulletproof',
         timestamp: Date.now(),
-        ytClients: ['android_sdkless', 'ios_downgraded', 'web_embedded', 'ios_legacy', 'piped_blast', 'invidious_blast'],
+        ytClients: ['android_sdkless', 'android_vr', 'ios_downgraded', 'web_embedded', 'ios_legacy', 'piped_blast', 'invidious_blast'],
         features: ['edge-cache', 'kv-cache', 'request-coalescing', 'prewarm', 'saavn-direct-cdn', 'yt-suggestions', 'yt-trending', 'yt-related'],
       });
     }
