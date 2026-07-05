@@ -34,19 +34,30 @@ const CACHE_TTL = {
 
 const SAAVN_API = 'https://www.jiosaavn.com/api.php';
 
+// ─── visitorData ─────────────────────────────────────────────────────────
+// PREVIOUSLY MISSING from every client context below. YouTube's innertube
+// API uses this field as a session-identity token — a request with no
+// visitorData looks anonymous/scripted in a way a real client's request
+// never would (real clients always carry one, assigned on first contact
+// with YouTube). Confirmed present in every working client context used
+// by ViMusic (github.com/vfsfitvnm/ViMusic, an actively-maintained YT
+// Music client with a good reliability track record). This is a static
+// placeholder value, not tied to any real session — it's not meant to
+// authenticate anything, just to make the request shape match what a
+// real client sends instead of omitting the field entirely.
+const YT_VISITOR_DATA = 'CgtEUlRINDFjdm1YayjX1pSaBg%3D%3D';
+
+// ─── X-Goog-Api-Key ──────────────────────────────────────────────────────
+// PREVIOUSLY MISSING. This is the public API key that YouTube Music's own
+// web client (music.youtube.com) sends on every innertube request —
+// confirmed present in ViMusic's Innertube.kt (defaultRequest block,
+// header "X-Goog-Api-Key"). Requests to the innertube endpoint without
+// this header are missing a piece every real client includes, which is
+// one more small signal (on top of visitorData) that distinguishes a
+// scripted request from a real client's request.
+const YT_API_KEY = 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8';
+
 // ─── Piped instances (verified live via status.piped.video, 2026-07) ────────
-// PREVIOUS LIST WAS MOSTLY DEAD: kavin.rocks was the only one still up.
-// adminforge.de, syncpundit.io, garudalinux.org, api.piped.yt, tokhmi.xyz,
-// moomoo.me, and leptons.xyz were all showing 0% uptime — every request to
-// them was pure wasted timeout latency (contributing directly to the "some
-// songs just hang" symptom, since blast-racing 9 guaranteed-dead endpoints
-// alongside 1 live one still costs a full timeout cycle before the live
-// one's response comes back). Replaced with currently-live public
-// instances. NOTE: Piped/Invidious public instances have historically
-// rotated every few months as Google pressures them — if songs start
-// failing again down the line, check https://status.piped.video and
-// https://github.com/TeamPiped/piped-uptime for current live instances
-// before assuming the code itself regressed.
 const PIPED_INSTANCES = [
   'https://pipedapi.kavin.rocks',
   'https://piped-api.lunar.icu',
@@ -55,11 +66,6 @@ const PIPED_INSTANCES = [
 ];
 
 // ─── Invidious instances (from official api.invidious.io list, 2026-07) ────
-// Official list requires 90%+ uptime to be listed at all, so these are the
-// most trustworthy public instances currently available. Kept the two from
-// the old list that still appear on the official list (nadeko.net,
-// melmac.space); replaced the rest, which weren't on the current official
-// list, with confirmed-current ones.
 const INVIDIOUS_INSTANCES = [
   'https://inv.nadeko.net',
   'https://iv.melmac.space',
@@ -71,7 +77,6 @@ const INVIDIOUS_INSTANCES = [
 
 // =============================================================================
 // STAGE 1: android_sdkless — No PoToken required (yt-dlp confirmed 2026)
-// clientName: ANDROID, version 20.10.38, no SDK linkage
 // =============================================================================
 async function ytAndroidSdkless(videoId) {
   try {
@@ -79,6 +84,7 @@ async function ytAndroidSdkless(videoId) {
       method: 'POST',
       headers: {
         'Content-Type':             'application/json',
+        'X-Goog-Api-Key':           YT_API_KEY,
         'User-Agent':               'com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip',
         'X-YouTube-Client-Name':    '3',
         'X-YouTube-Client-Version': '20.10.38',
@@ -92,7 +98,7 @@ async function ytAndroidSdkless(videoId) {
             osName:           'Android',
             osVersion:        '11',
             androidSdkVersion: 30,
-            hl: 'en', gl: 'US',
+            hl: 'en', gl: 'US', visitorData: YT_VISITOR_DATA,
           },
         },
       }),
@@ -101,7 +107,10 @@ async function ytAndroidSdkless(videoId) {
     if (!resp.ok) return null;
     const data = await resp.json();
     const result = _extractBestAudio(data, 'android_sdkless');
-    return result;
+    if (result) return result;
+    // NEW: this client's response can still carry usable muxed formats
+    // even when adaptiveFormats comes back empty/blocked.
+    return _extractMuxed(data, 'android_sdkless_muxed');
   } catch (_) { return null; }
 }
 
@@ -114,6 +123,7 @@ async function ytIosDowngraded(videoId) {
       method: 'POST',
       headers: {
         'Content-Type':             'application/json',
+        'X-Goog-Api-Key':           YT_API_KEY,
         'User-Agent':               'com.google.ios.youtube/19.29.1 (iPhone14,3; U; CPU iOS 17_5_1 like Mac OS X)',
         'X-YouTube-Client-Name':    '5',
         'X-YouTube-Client-Version': '19.29.1',
@@ -127,7 +137,7 @@ async function ytIosDowngraded(videoId) {
             deviceModel:   'iPhone14,3',
             osName:        'iPhone',
             osVersion:     '17.5.1.21F90',
-            hl: 'en', gl: 'US',
+            hl: 'en', gl: 'US', visitorData: YT_VISITOR_DATA,
           },
         },
       }),
@@ -135,7 +145,9 @@ async function ytIosDowngraded(videoId) {
     });
     if (!resp.ok) return null;
     const data = await resp.json();
-    return _extractBestAudio(data, 'ios_downgraded');
+    const result = _extractBestAudio(data, 'ios_downgraded');
+    if (result) return result;
+    return _extractMuxed(data, 'ios_downgraded_muxed');
   } catch (_) { return null; }
 }
 
@@ -148,6 +160,7 @@ async function ytWebEmbedded(videoId) {
       method: 'POST',
       headers: {
         'Content-Type':             'application/json',
+        'X-Goog-Api-Key':           YT_API_KEY,
         'User-Agent':               'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
         'X-YouTube-Client-Name':    '56',
         'X-YouTube-Client-Version': '1.20240516.00.00',
@@ -160,7 +173,7 @@ async function ytWebEmbedded(videoId) {
           client: {
             clientName:    'WEB_EMBEDDED_PLAYER',
             clientVersion: '1.20240516.00.00',
-            hl: 'en', gl: 'US',
+            hl: 'en', gl: 'US', visitorData: YT_VISITOR_DATA,
           },
           thirdParty: {
             embedUrl: 'https://www.youtube.com/',
@@ -176,12 +189,14 @@ async function ytWebEmbedded(videoId) {
     if (hlsUrl) {
       return { url: hlsUrl, quality: 'hls', source: 'web_embedded_hls', isHls: true };
     }
-    return _extractBestAudio(data, 'web_embedded');
+    const result = _extractBestAudio(data, 'web_embedded');
+    if (result) return result;
+    return _extractMuxed(data, 'web_embedded_muxed');
   } catch (_) { return null; }
 }
 
 // =============================================================================
-// STAGE 4 (legacy): Old IOS/ANDROID clients — kept as last innertube attempt
+// STAGE 4 (legacy): Old IOS client — kept as last innertube attempt
 // =============================================================================
 async function ytLegacyIos(videoId) {
   try {
@@ -189,6 +204,7 @@ async function ytLegacyIos(videoId) {
       method: 'POST',
       headers: {
         'Content-Type':             'application/json',
+        'X-Goog-Api-Key':           YT_API_KEY,
         'User-Agent':               'com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1 like Mac OS X)',
         'X-YouTube-Client-Name':    '5',
         'X-YouTube-Client-Version': '19.45.4',
@@ -202,7 +218,7 @@ async function ytLegacyIos(videoId) {
             deviceModel:   'iPhone16,2',
             osName:        'iPhone',
             osVersion:     '18.1',
-            hl: 'en', gl: 'US',
+            hl: 'en', gl: 'US', visitorData: YT_VISITOR_DATA,
           },
         },
       }),
@@ -210,26 +226,15 @@ async function ytLegacyIos(videoId) {
     });
     if (!resp.ok) return null;
     const data = await resp.json();
-    return _extractBestAudio(data, 'ios_legacy');
+    const result = _extractBestAudio(data, 'ios_legacy');
+    if (result) return result;
+    return _extractMuxed(data, 'ios_legacy_muxed');
   } catch (_) { return null; }
 }
 
 // =============================================================================
 // STAGE: ANDROID_VR — confirmed (yt-dlp, Jan-Mar 2026 maintenance commits) as
-// one of the few clients that still works WITHOUT a PoToken. yt-dlp actually
-// made this their #1 default client as of early 2026 (ahead of ios_downgraded
-// and web variants), specifically because most other clients now require
-// PoToken for GVS. Parameters below (clientVersion 1.71.26, Oculus Quest 3
-// device strings) match yt-dlp's current values — these drift every few
-// months as YouTube revs its internal client versions, so if this stage
-// stops working, check yt-dlp's youtube extractor source for the current
-// android_vr block before assuming the approach itself is dead.
-// NOTE: some regions see this client intermittently return only a single
-// low-quality (360p) format instead of the full format list — that's a
-// known yt-dlp-tracked issue (upstream #16150), not a bug in this worker.
-// It still races alongside the other clients here, so a bad low-quality
-// response from this stage just loses the race to a better one, rather
-// than being the only option.
+// one of the few clients that still works WITHOUT a PoToken.
 // =============================================================================
 async function ytAndroidVr(videoId) {
   try {
@@ -237,6 +242,7 @@ async function ytAndroidVr(videoId) {
       method: 'POST',
       headers: {
         'Content-Type':             'application/json',
+        'X-Goog-Api-Key':           YT_API_KEY,
         'User-Agent':               'com.google.android.apps.youtube.vr.oculus/1.71.26 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
         'X-YouTube-Client-Name':    '28',
         'X-YouTube-Client-Version': '1.71.26',
@@ -252,7 +258,7 @@ async function ytAndroidVr(videoId) {
             androidSdkVersion: 32,
             osName:            'Android',
             osVersion:         '12L',
-            hl: 'en', gl: 'US',
+            hl: 'en', gl: 'US', visitorData: YT_VISITOR_DATA,
           },
         },
       }),
@@ -260,20 +266,64 @@ async function ytAndroidVr(videoId) {
     });
     if (!resp.ok) return null;
     const data = await resp.json();
-    return _extractBestAudio(data, 'android_vr');
+    const result = _extractBestAudio(data, 'android_vr');
+    if (result) return result;
+    return _extractMuxed(data, 'android_vr_muxed');
   } catch (_) { return null; }
 }
 
-// ─── Audio extraction helper ──────────────────────────────────────────────────
+// =============================================================================
+// STAGE: TV_EMBEDDED — TVHTML5_SIMPLY_EMBEDDED_PLAYER client.
+// Sourced from ViMusic (github.com/vfsfitvnm/ViMusic), where it's used
+// specifically as an age-restriction/bot-detection bypass path — a
+// genuinely different client identity from every other stage here (none
+// of the above use the TV surface). Kept as an independent stage in the
+// race rather than replacing anything, since no single client identity
+// has proven permanently reliable — the point is more independent paths,
+// not swapping one for another.
+// =============================================================================
+async function ytTvEmbedded(videoId) {
+  try {
+    const resp = await fetch('https://www.youtube.com/youtubei/v1/player', {
+      method: 'POST',
+      headers: {
+        'Content-Type':             'application/json',
+        'X-Goog-Api-Key':           YT_API_KEY,
+        'X-YouTube-Client-Name':    '85',
+        'X-YouTube-Client-Version': '2.0',
+      },
+      body: JSON.stringify({
+        videoId,
+        context: {
+          client: {
+            clientName:    'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
+            clientVersion: '2.0',
+            platform:      'TV',
+            hl: 'en', gl: 'US', visitorData: YT_VISITOR_DATA,
+          },
+          thirdParty: {
+            embedUrl: `https://www.youtube.com/watch?v=${videoId}`,
+          },
+        },
+      }),
+      signal: AbortSignal.timeout(7000),
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    const result = _extractBestAudio(data, 'tv_embedded');
+    if (result) return result;
+    return _extractMuxed(data, 'tv_embedded_muxed');
+  } catch (_) { return null; }
+}
+
+// ─── Audio extraction helper (adaptive, audio-only) ──────────────────────────
 function _extractBestAudio(data, source) {
-  // Check for bot detection / login required
   const status = data?.playabilityStatus?.status;
   if (status === 'LOGIN_REQUIRED' || status === 'ERROR') return null;
 
   const formats = data?.streamingData?.adaptiveFormats || [];
   if (!formats.length) return null;
 
-  // Prefer m4a/mp4 audio (most compatible with ExoPlayer/just_audio)
   const m4a = formats
     .filter(f => f.url && (f.mimeType?.includes('audio/mp4') || f.mimeType?.includes('audio/m4a')))
     .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
@@ -283,10 +333,10 @@ function _extractBestAudio(data, source) {
       quality: `${Math.round((m4a[0].bitrate || 0) / 1000)}kbps`,
       source,
       mime:    m4a[0].mimeType,
+      isMuxed: false,
     };
   }
 
-  // Fallback: any audio format
   const anyAudio = formats
     .filter(f => f.url && f.mimeType?.includes('audio'))
     .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
@@ -296,9 +346,53 @@ function _extractBestAudio(data, source) {
       quality: `${Math.round((anyAudio[0].bitrate || 0) / 1000)}kbps`,
       source,
       mime:    anyAudio[0].mimeType,
+      isMuxed: false,
     };
   }
   return null;
+}
+
+// =============================================================================
+// NEW: muxed (progressive, video+audio combined) format extraction.
+//
+// WHY THIS EXISTS: adaptiveFormats (audio-only) is the format YouTube's
+// bot-detection scrutinizes hardest, because it's the format used almost
+// exclusively by non-browser API clients (exactly what we are). Legacy
+// muxed/progressive formats (itag 18 = 360p, itag 22 = 720p, both
+// video+audio in ONE stream) are still served for basic/legacy playback
+// compatibility and historically face looser scrutiny.
+//
+// This is a genuine fallback, not a guarantee — YouTube can and does
+// throttle/restrict these too. It's an additional independent path to
+// race alongside the audio-only ones, not a replacement for them.
+//
+// The client (ExoPlayer/Media3) is responsible for decoding audio-only
+// out of this stream (disable the video track renderer) — see
+// AurumAudioEngine.kt trackSelector config. We do NOT strip video here;
+// stripping video server-side would mean re-muxing/transcoding on the
+// Worker, which Cloudflare Workers cannot do (no ffmpeg, CPU-time limited).
+// =============================================================================
+function _extractMuxed(data, source) {
+  const status = data?.playabilityStatus?.status;
+  if (status === 'LOGIN_REQUIRED' || status === 'ERROR') return null;
+
+  const muxed = data?.streamingData?.formats || [];
+  if (!muxed.length) return null;
+
+  // Prefer itag 22 (720p, better audio bitrate ~192kbps) then itag 18
+  // (360p, ~96kbps) — both carry audio, fall back to whatever's biggest.
+  const byItag = (itag) => muxed.find(f => f.itag === itag && f.url);
+  const best = byItag(22) || byItag(18) ||
+    [...muxed].filter(f => f.url).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0))[0];
+
+  if (!best) return null;
+  return {
+    url:     best.url,
+    quality: `muxed-${best.qualityLabel || best.itag}`,
+    source,
+    mime:    best.mimeType,
+    isMuxed: true,
+  };
 }
 
 // =============================================================================
@@ -349,7 +443,7 @@ async function ytAudioPipedSingle(videoId, instance) {
     if (!streams.length) { recordFailure(instance); return null; }
     streams.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
     recordSuccess(instance, Date.now() - t0);
-    return { url: streams[0].url, quality: streams[0].quality || 'unknown', source: 'piped', instance };
+    return { url: streams[0].url, quality: streams[0].quality || 'unknown', source: 'piped', instance, isMuxed: false };
   } catch (_) { recordFailure(instance); return null; }
 }
 
@@ -365,24 +459,28 @@ async function ytAudioInvidiousSingle(videoId, instance) {
     const data = await resp.json();
     const adaptive = (data.adaptiveFormats || []).filter(f => f.url);
     const mp4 = adaptive.filter(f => f.type?.includes('audio/mp4')).sort((a, b) => (b.bitrate||0) - (a.bitrate||0));
-    if (mp4.length) { recordSuccess(instance, Date.now()-t0); return { url: mp4[0].url, quality: mp4[0].audioQuality||'unknown', source: 'invidious', instance }; }
+    if (mp4.length) { recordSuccess(instance, Date.now()-t0); return { url: mp4[0].url, quality: mp4[0].audioQuality||'unknown', source: 'invidious', instance, isMuxed: false }; }
     const webm = adaptive.filter(f => f.type?.includes('audio/webm')).sort((a, b) => (b.bitrate||0) - (a.bitrate||0));
-    if (webm.length) { recordSuccess(instance, Date.now()-t0); return { url: webm[0].url, quality: webm[0].audioQuality||'unknown', source: 'invidious', instance }; }
+    if (webm.length) { recordSuccess(instance, Date.now()-t0); return { url: webm[0].url, quality: webm[0].audioQuality||'unknown', source: 'invidious', instance, isMuxed: false }; }
+    // NEW: Invidious also exposes formatStreams (muxed) — try before giving up
+    const muxedList = (data.formatStreams || []).filter(f => f.url);
+    if (muxedList.length) {
+      muxedList.sort((a, b) => (parseInt(b.itag)||0) - (parseInt(a.itag)||0));
+      recordSuccess(instance, Date.now()-t0);
+      return { url: muxedList[0].url, quality: `muxed-${muxedList[0].quality||muxedList[0].itag}`, source: 'invidious_muxed', instance, isMuxed: true };
+    }
     recordFailure(instance); return null;
   } catch (_) { recordFailure(instance); return null; }
 }
 
 // =============================================================================
-// MAIN RESOLUTION ENGINE v6
-// Parallel 5-stage race — first valid URL wins
+// MAIN RESOLUTION ENGINE v6.1 — now races muxed formats alongside audio-only
+// Parallel race — first valid, LIVE URL wins.
 // =============================================================================
 async function resolveYtStreamFast(videoId) {
   const ranked    = sortedInstances(PIPED_INSTANCES);
   const invRanked = sortedInstances(INVIDIOUS_INSTANCES);
 
-  // Wrap candidate URLs with a quick liveness check before accepting them.
-  // Prevents handing back expired/IP-locked googlevideo URLs that resolve
-  // "successfully" but go idle@0ms in ExoPlayer (silent fresh-start failure).
   async function validated(p) {
     const r = await p;
     if (!r || !r.url) return null;
@@ -390,17 +488,13 @@ async function resolveYtStreamFast(videoId) {
     return ok ? r : null;
   }
 
-  // ── COMBINED RACE: fire all stages at once instead of sequential
-  // waterfall (was Stage1 → wait fail → Stage4 → wait fail → Stage5,
-  // which could stack up to 15-20s+ on a bad client). Racing everything
-  // together means total latency = fastest working source, not sum of
-  // failed stages.
   const allAttempts = [
     validated(ytAndroidSdkless(videoId)),
     validated(ytAndroidVr(videoId)),
     validated(ytIosDowngraded(videoId)),
     validated(ytWebEmbedded(videoId)),
     validated(ytLegacyIos(videoId)),
+    validated(ytTvEmbedded(videoId)),
     ...ranked.map(inst => validated(ytAudioPipedSingle(videoId, inst))),
     ...invRanked.map(inst => validated(ytAudioInvidiousSingle(videoId, inst))),
   ].map(p => p.then(r => r ?? Promise.reject('null')).catch(e => Promise.reject(e)));
@@ -412,8 +506,6 @@ async function resolveYtStreamFast(videoId) {
   }
 }
 
-// Quick liveness probe — HEAD first, fall back to ranged GET (some CDNs
-// reject HEAD). Short timeout so it doesn't blow up total resolve latency.
 async function isUrlAlive(url) {
   try {
     const head = await fetch(url, {
@@ -422,7 +514,6 @@ async function isUrlAlive(url) {
     });
     if (head.ok) return true;
     if (head.status === 405 || head.status === 403) {
-      // Some CDNs disallow HEAD or need a byte-range — try a tiny ranged GET
       const ranged = await fetch(url, {
         method: 'GET',
         headers: { Range: 'bytes=0-1023' },
@@ -476,24 +567,12 @@ async function getYtStreamCached(videoId, env, ctx) {
         h.set('X-Latency', '0');
         return new Response(resp.body, { status: resp.status, headers: h });
       }
-      // stale/dead — fall through to re-resolve, also drop the bad edge entry
       ctx.waitUntil(caches.default.delete(edgeCacheKey));
     } catch (_) {}
   }
 
   const kvData = await kvGet(env, `yt:${videoId}`);
   if (kvData?.url) {
-    // FIX: the edge-cache path above already re-validates via isUrlAlive()
-    // before serving, but this KV path was handing back kvData.url with NO
-    // liveness check at all. googlevideo.com URLs carry an `expire=` param
-    // and are IP-locked to the Worker's resolving IP — if the KV entry is
-    // stale (TTL says "still valid" but YouTube's signature already
-    // expired, or Cloudflare rotated edge IPs), ExoPlayer gets a silent
-    // 403 with zero error surfaced, which is indistinguishable from
-    // "still loading" on the phone. Same validation as the edge path, and
-    // same self-healing behavior: a dead KV entry gets deleted so the next
-    // request falls through to a fresh resolve instead of serving the same
-    // dead URL again.
     if (await isUrlAlive(kvData.url)) {
       const resp = jsonResp({ success: true, ...kvData, videoId, fromKV: true });
       const h = new Headers(resp.headers);
@@ -525,14 +604,6 @@ async function handleYtStream(videoId, env, ctx) {
   const resolutionPromise = (async () => {
     let audio = await resolveYtStreamFast(videoId);
 
-    // FIX: retry-with-backoff on total resolve failure. YouTube's bot
-    // detection is intermittent (confirmed: same client can pass/fail
-    // seconds apart), so if every stage failed simultaneously it's often
-    // a transient/coincidental block, not a genuinely dead video. A single
-    // retry after a short delay likely hits a different Cloudflare
-    // edge/connection and a different momentary state on YouTube's side.
-    // Bounded to ONE retry so worst-case added latency stays small
-    // (~400-600ms) instead of compounding into a long hang.
     if (!audio) {
       await new Promise(r => setTimeout(r, 400 + Math.floor(Math.random() * 200)));
       audio = await resolveYtStreamFast(videoId);
@@ -903,40 +974,47 @@ async function handleStreamProxy(request, encodedUrl, ctx) {
 }
 
 // =============================================================================
-// Debug endpoint v6 — tests all 5 resolution stages individually
+// Debug endpoint v6.1 — tests all resolution stages individually, incl. muxed
 // =============================================================================
 async function handleDebugYt(videoId) {
   const report = {};
 
-  // Test android_sdkless
   try {
     const t0 = Date.now();
     const r = await ytAndroidSdkless(videoId);
-    report.android_sdkless = { ok: !!r, ms: Date.now() - t0, source: r?.source, quality: r?.quality };
+    report.android_sdkless = { ok: !!r, ms: Date.now() - t0, source: r?.source, quality: r?.quality, isMuxed: r?.isMuxed };
   } catch (e) { report.android_sdkless = { ok: false, error: String(e) }; }
 
-  // Test ios_downgraded
   try {
     const t0 = Date.now();
     const r = await ytIosDowngraded(videoId);
-    report.ios_downgraded = { ok: !!r, ms: Date.now() - t0, source: r?.source, quality: r?.quality };
+    report.ios_downgraded = { ok: !!r, ms: Date.now() - t0, source: r?.source, quality: r?.quality, isMuxed: r?.isMuxed };
   } catch (e) { report.ios_downgraded = { ok: false, error: String(e) }; }
 
-  // Test web_embedded
   try {
     const t0 = Date.now();
     const r = await ytWebEmbedded(videoId);
-    report.web_embedded = { ok: !!r, ms: Date.now() - t0, source: r?.source, quality: r?.quality, isHls: r?.isHls };
+    report.web_embedded = { ok: !!r, ms: Date.now() - t0, source: r?.source, quality: r?.quality, isHls: r?.isHls, isMuxed: r?.isMuxed };
   } catch (e) { report.web_embedded = { ok: false, error: String(e) }; }
 
-  // Test legacy IOS
   try {
     const t0 = Date.now();
     const r = await ytLegacyIos(videoId);
-    report.ios_legacy = { ok: !!r, ms: Date.now() - t0, source: r?.source, quality: r?.quality };
+    report.ios_legacy = { ok: !!r, ms: Date.now() - t0, source: r?.source, quality: r?.quality, isMuxed: r?.isMuxed };
   } catch (e) { report.ios_legacy = { ok: false, error: String(e) }; }
 
-  // Test Piped instances
+  try {
+    const t0 = Date.now();
+    const r = await ytAndroidVr(videoId);
+    report.android_vr = { ok: !!r, ms: Date.now() - t0, source: r?.source, quality: r?.quality, isMuxed: r?.isMuxed };
+  } catch (e) { report.android_vr = { ok: false, error: String(e) }; }
+
+  try {
+    const t0 = Date.now();
+    const r = await ytTvEmbedded(videoId);
+    report.tv_embedded = { ok: !!r, ms: Date.now() - t0, source: r?.source, quality: r?.quality, isMuxed: r?.isMuxed };
+  } catch (e) { report.tv_embedded = { ok: false, error: String(e) }; }
+
   report.piped = [];
   for (const inst of PIPED_INSTANCES) {
     const t0 = Date.now();
@@ -956,7 +1034,6 @@ async function handleDebugYt(videoId) {
     }
   }
 
-  // Test Invidious instances
   report.invidious = [];
   for (const inst of INVIDIOUS_INSTANCES) {
     const t0 = Date.now();
@@ -966,17 +1043,19 @@ async function handleDebugYt(videoId) {
       });
       const status = resp.status;
       let formatCount = null;
+      let muxedCount = null;
       if (resp.ok) {
         const data = await resp.json();
         formatCount = (data.adaptiveFormats || []).length;
+        muxedCount  = (data.formatStreams || []).length;
       }
-      report.invidious.push({ instance: inst, status, ms: Date.now() - t0, adaptiveFormats: formatCount });
+      report.invidious.push({ instance: inst, status, ms: Date.now() - t0, adaptiveFormats: formatCount, muxedFormats: muxedCount });
     } catch (e) {
       report.invidious.push({ instance: inst, error: String(e), ms: Date.now() - t0 });
     }
   }
 
-  return jsonResp({ success: true, videoId, workerVersion: 'v6.0', report });
+  return jsonResp({ success: true, videoId, workerVersion: 'v6.1', report });
 }
 
 // =============================================================================
@@ -1026,7 +1105,7 @@ function jsonResp(data, status = 200) {
       'Content-Type': 'application/json',
       'Access-Control-Allow-Origin': '*',
       'X-Cache': 'MISS',
-      'X-Worker-Version': 'v6.0',
+      'X-Worker-Version': 'v6.1',
     },
   });
 }
@@ -1034,31 +1113,22 @@ function jsonResp(data, status = 200) {
 
 // =============================================================================
 // YT PROXY — pipes googlevideo bytes through Cloudflare edge
-// Googlevideo URLs are IP-locked to the resolving server's IP (Cloudflare).
-// Giving the raw URL to ExoPlayer fails because phone's IP != Cloudflare IP.
-// This endpoint resolves the video, then streams the bytes back to the phone
-// through Cloudflare — same IP that resolved = no IP mismatch.
 // =============================================================================
 async function handleYtProxy(videoId, request, env, ctx) {
   if (!videoId) return new Response('id required', { status: 400 });
 
-  // Get the resolved audio URL (from cache or fresh resolve)
   let audioUrl = null;
 
-  // Check KV cache first
   const kvData = await kvGet(env, `yt:${videoId}`);
   if (kvData?.url) {
     audioUrl = kvData.url;
   } else {
-    // Fresh resolve
     const audio = await resolveYtStreamFast(videoId);
     if (!audio?.url) return new Response('Could not resolve stream', { status: 502 });
     audioUrl = audio.url;
-    // Cache it
     ctx.waitUntil(kvSet(env, `yt:${videoId}`, audio, CACHE_TTL.ytKV));
   }
 
-  // Proxy the audio bytes
   const rangeHeader = request.headers.get('Range');
   const upstream = await fetch(audioUrl, {
     headers: {
@@ -1069,7 +1139,6 @@ async function handleYtProxy(videoId, request, env, ctx) {
   }).catch(() => null);
 
   if (!upstream || (!upstream.ok && upstream.status !== 206)) {
-    // URL expired — fresh resolve and retry once
     const audio = await resolveYtStreamFast(videoId);
     if (!audio?.url) return new Response('Stream unavailable', { status: 502 });
     ctx.waitUntil(kvSet(env, `yt:${videoId}`, audio, CACHE_TTL.ytKV));
@@ -1146,10 +1215,10 @@ export default {
     if (pathname === '/health') {
       return jsonResp({
         status: 'ok',
-        worker: 'aurum-v6.0-bulletproof',
+        worker: 'aurum-v6.1-muxed-fallback',
         timestamp: Date.now(),
-        ytClients: ['android_sdkless', 'android_vr', 'ios_downgraded', 'web_embedded', 'ios_legacy', 'piped_blast', 'invidious_blast'],
-        features: ['edge-cache', 'kv-cache', 'request-coalescing', 'prewarm', 'saavn-direct-cdn', 'yt-suggestions', 'yt-trending', 'yt-related'],
+        ytClients: ['android_sdkless', 'android_vr', 'ios_downgraded', 'web_embedded', 'ios_legacy', 'tv_embedded', 'piped_blast', 'invidious_blast'],
+        features: ['edge-cache', 'kv-cache', 'request-coalescing', 'prewarm', 'saavn-direct-cdn', 'yt-suggestions', 'yt-trending', 'yt-related', 'muxed-fallback', 'visitor-data'],
       });
     }
 
