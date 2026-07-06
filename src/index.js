@@ -105,37 +105,9 @@ async function fetchWithTimeout(url, options, timeoutMs = FETCH_TIMEOUT_MS) {
 // Returns the full playerResponse json, or null if all retries failed
 // to produce a response with an actually-usable audio URL.
 // =============================================================================
-async function ytAndroidVr(videoId, attempts = 3, pot = null) {
+async function ytAndroidVr(videoId, attempts = 3) {
   for (let i = 0; i < attempts; i++) {
     try {
-      const context = {
-        client: {
-          clientName: 'ANDROID_VR',
-          clientVersion: '1.71.26',
-          osVersion: '12L',
-          hl: 'en',
-          gl: 'US',
-        },
-      };
-      // Attach visitorData if the POT provider gave us one — InnerTube
-      // uses this to correlate the session the PO Token was minted for.
-      if (pot?.visitorData) {
-        context.client.visitorData = pot.visitorData;
-      }
-
-      const body = { videoId, context };
-      // serviceIntegrityDimensions.poToken is where YouTube's InnerTube
-      // player endpoint expects the PO Token (per the yt-dlp POT-provider
-      // integration this server implements the other half of). This is
-      // an undocumented Google-internal field name, so it can change
-      // without notice — if requests start failing again after working,
-      // this is the first thing to re-verify against a current yt-dlp
-      // debug log (yt-dlp -v with bgutil configured shows the exact
-      // request shape it sends).
-      if (pot?.poToken) {
-        body.serviceIntegrityDimensions = { poToken: pot.poToken };
-      }
-
       const resp = await fetchWithTimeout('https://www.youtube.com/youtubei/v1/player', {
         method: 'POST',
         headers: {
@@ -144,15 +116,21 @@ async function ytAndroidVr(videoId, attempts = 3, pot = null) {
           'X-YouTube-Client-Name': '28',
           'X-YouTube-Client-Version': '1.71.26',
         },
-        body: JSON.stringify(body),
+        body: JSON.stringify({
+          videoId,
+          context: {
+            client: {
+              clientName: 'ANDROID_VR',
+              clientVersion: '1.71.26',
+              osVersion: '12L',
+              hl: 'en',
+              gl: 'US',
+            },
+          },
+        }),
       });
       const json = await resp.json().catch(() => null);
       if (json?.playabilityStatus?.status === 'OK') {
-        // Confirm this attempt actually gave us a usable audio URL —
-        // the SABR-only experiment returns status "OK" but with
-        // adaptiveFormats entries that have no `url` field at all, which
-        // extractAudioUrl() would otherwise silently treat as "no audio
-        // formats" without us knowing WHY this attempt failed.
         const hasUsableAudio = (json?.streamingData?.adaptiveFormats || [])
           .some((f) => f.url && f.mimeType?.includes('audio'));
         if (hasUsableAudio) return json;
@@ -162,6 +140,62 @@ async function ytAndroidVr(videoId, attempts = 3, pot = null) {
     }
   }
   return null;
+}
+
+// =============================================================================
+// PO-TOKEN-BACKED WEB_EMBEDDED_PLAYER attempt — this is the one that can
+// actually use the bgutil PO Token correctly.
+//
+// CRITICAL CORRECTION: PO Tokens are platform-bound — a token from
+// BotGuard (web-based attestation, which is what our bgutil provider runs)
+// literally cannot be used with ANDROID_VR (which is authenticated via
+// DroidGuard, a different attestation system entirely). Attaching the
+// bgutil token to the ANDROID_VR request in the first version of this fix
+// was invalid by construction, which is why it made no difference. Source:
+// yt-dlp's own PO Token Guide — "A PO Token from one platform cannot be
+// used on another (i.e., Web PO Token cannot be used on Android or iOS)."
+// The web-family client this token IS valid for is WEB_EMBEDDED_PLAYER,
+// so that's the client this attempt uses.
+// =============================================================================
+async function ytWebEmbeddedWithPot(videoId, pot) {
+  if (!pot?.poToken) return null;
+  try {
+    const context = {
+      client: {
+        clientName: 'WEB_EMBEDDED_PLAYER',
+        clientVersion: '1.20250101.00.00',
+        hl: 'en',
+        gl: 'US',
+      },
+      thirdParty: {
+        embedUrl: `https://www.youtube.com/watch?v=${videoId}`,
+      },
+    };
+    if (pot.visitorData) {
+      context.client.visitorData = pot.visitorData;
+    }
+    const resp = await fetchWithTimeout('https://www.youtube.com/youtubei/v1/player', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      },
+      body: JSON.stringify({
+        videoId,
+        context,
+        serviceIntegrityDimensions: { poToken: pot.poToken },
+      }),
+    });
+    const json = await resp.json().catch(() => null);
+    if (json?.playabilityStatus?.status === 'OK') {
+      const hasUsableAudio = (json?.streamingData?.adaptiveFormats || [])
+        .some((f) => f.url && f.mimeType?.includes('audio'));
+      if (hasUsableAudio) return json;
+    }
+    return null;
+  } catch (_) {
+    return null;
+  }
 }
 
 // =============================================================================
@@ -303,13 +337,21 @@ async function ytPipedFallback(videoId, safePlayerResponse) {
 async function resolveYtStream(videoId) {
   // Fetch a PO Token first. If the provider is cold/asleep/down, this
   // returns null after its own timeout, and everything below proceeds
-  // exactly as it did before the PO Token was introduced — this is an
-  // enhancement layered on top of the existing chain, not a replacement
-  // for it, so a POT-provider outage can't take down YouTube playback
-  // entirely.
+  // exactly as it did before the PO Token was introduced.
   const pot = await fetchPoToken();
 
-  const androidVrResponse = await ytAndroidVr(videoId, 3, pot);
+  // Try the PO-Token-backed WEB_EMBEDDED_PLAYER attempt first when we
+  // have a token — this is the only client in this chain a bgutil
+  // (BotGuard/web) token is actually valid for, so it's the one with the
+  // real shot at bypassing bot detection.
+  if (pot?.poToken) {
+    const webResponse = await ytWebEmbeddedWithPot(videoId, pot);
+    if (webResponse) {
+      return extractAudioUrl(webResponse);
+    }
+  }
+
+  const androidVrResponse = await ytAndroidVr(videoId, 3);
   if (androidVrResponse) {
     return extractAudioUrl(androidVrResponse);
   }
