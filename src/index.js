@@ -1,46 +1,38 @@
 // =============================================================================
 // Aurum Music — Cloudflare Worker — YT resolution
-// (Updated 2026-07-07: android_vr is confirmed still the primary
-//  PoToken-free client as of yt-dlp 2026.07.04, but it has become
-//  ERRATIC — YouTube is randomly A/B-testing a "SABR-only" experiment
-//  that makes android_vr's adaptiveFormats come back with no `url` field
-//  on some requests and a valid one on the very next request for the
-//  SAME video. Source: yt-dlp issues #16150, #15780, VRChat feedback
-//  threads, confirmed as of March-July 2026. This is not fixable by
-//  switching clients — it's request-level flakiness, so the fix is
-//  RETRYING the same client a couple of times before giving up on it,
-//  not just falling through once.)
+// (Updated 2026-07-07 v2: fixes the resolve-time blowup from the previous
+//  version. Root cause of "Resolve failed... page needs to be reloaded":
+//  POT_FETCH_TIMEOUT_MS was 45000 (45s) and this ran as the FIRST, BLOCKING
+//  step of every single resolve. Render's free tier cold-starts in 30-50s,
+//  so on a cold PO Token provider, EVERY resolve waited up to 45s before
+//  even trying android_vr — then still had android_vr(3 retries) + ios +
+//  tv + piped(4 instances) stacked AFTER that. Worst case ~90+ seconds for
+//  one song. The app-side timeout/reload was firing before the Worker even
+//  finished, which is exactly the symptom in the screenshot.
 //
-// ATTEMPT 1 — ANDROID_VR client, up to 3 tries (handles the SABR-only
-//   flakiness described above; each retry is a fresh request, YouTube's
-//   experiment bucketing is per-request, not per-session).
-//
-// ATTEMPT 2 (only if attempt 1 never got a usable audio URL) — iOS
-//   client. Still commonly PoToken-free/unobfuscated as of early-mid
-//   2026 per YoutubeExplode/yt-dlp community tracking, and represents a
-//   genuinely different client fingerprint than ANDROID_VR, so it is
-//   not just "trying the same broken thing again."
-//
-// ATTEMPT 3 (only if attempt 2 also fails) — TVHTML5_SIMPLY_EMBEDDED_PLAYER
-//   bypass client, as before.
-//
-// ATTEMPT 4 (only if attempt 3 succeeds OR as a last resort if nothing
-//   above produced a URL) — Piped, tried across MULTIPLE instances in
-//   sequence (not just one), each with its own short timeout, matched
-//   by CLOSEST bitrate. If every instance fails/times out, we surface
-//   a clear error instead of silently returning nothing.
-//
-// No caching, no coalescing — same minimal shape as before, just each
-// stage is now retry/multi-instance hardened instead of single-shot.
+//  Fixes in this version:
+//   1. PO Token fetch is capped at POT_FETCH_TIMEOUT_MS = 3000 (3s), not
+//      45s. If the provider is cold/asleep, we skip it for THIS request
+//      and fall through to the no-PoToken chain immediately — a slow POT
+//      provider degrades to "old behavior for this one request," not
+//      "block everything."
+//   2. A separate, fire-and-forget keepAlivePot() ping is sent on every
+//      request (not awaited) purely to wake/keep the Render instance warm,
+//      so subsequent requests are more likely to get a fast PO Token even
+//      though the current request didn't wait for it.
+//   3. resolveYtStream() now enforces a hard overall budget
+//      (TOTAL_RESOLVE_BUDGET_MS) across the whole client chain using
+//      withDeadline() — if we're out of budget, we stop trying further
+//      clients/Piped instances and return whatever error we have, instead
+//      of silently compounding timeouts to 90+ seconds.
+//   4. Per-client timeouts trimmed slightly so 3x android_vr + ios + tv +
+//      piped can realistically fit inside the overall budget.
 // =============================================================================
 
 const SAAVN_API = 'https://www.jiosaavn.com/api.php';
 
 // Multiple Piped instances tried in order. Each one is independently
-// operated and can go down without notice — trying only one (as before)
-// meant a single volunteer server's downtime took out the entire last
-// line of defense. List sourced from the actively-maintained
-// TeamPiped/Piped instance wiki (checked 2026-07-07).
+// operated and can go down without notice.
 const PIPED_INSTANCES = [
   'https://pipedapi.adminforge.de',
   'https://api.piped.yt',
@@ -48,47 +40,22 @@ const PIPED_INSTANCES = [
   'https://pipedapi.reallyaweso.me',
 ];
 
-const FETCH_TIMEOUT_MS = 6000;
+const FETCH_TIMEOUT_MS = 5000;
+
+// Overall hard cap for the ENTIRE resolveYtStream() call, across every
+// client + Piped instance combined. This is the single most important
+// number in this file: it guarantees the app never waits longer than this
+// for a resolve to give up and move to the next song, no matter how many
+// individual retries/instances are configured above.
+const TOTAL_RESOLVE_BUDGET_MS = 15000;
 
 // PO Token provider — self-hosted bgutil-ytdlp-pot-provider on Render.
-// This is what actually gets past YouTube's bot-check consistently;
-// everything else in this file (client rotation, retries, Piped) was the
-// best available approach WITHOUT a PO Token, which is why it still failed
-// on most videos. A PO Token proves the request came from a real BotGuard
-// attestation flow instead of a bare HTTP client.
-//
-// IMPORTANT — this is a free-tier Render service: it spins down after
-// inactivity and the first request after idle can take 30-50s to wake up.
-// POT_FETCH_TIMEOUT_MS is intentionally longer than the YT-client timeout
-// to give a cold-started instance a chance, but if it's still not up in
-// time, we fall through to the existing no-PoToken chain rather than
-// failing the whole request — a slow/asleep POT provider should degrade
-// to "old behavior," not "total failure."
+// IMPORTANT: this timeout is intentionally SHORT now. We are not trying to
+// wait out a cold start here — see keepAlivePot() below for how we handle
+// that instead. If the provider doesn't answer in 3s, we proceed without
+// a token for this request rather than blocking it.
 const POT_PROVIDER_URL = 'https://aurum-pot.onrender.com/get_pot';
-const POT_FETCH_TIMEOUT_MS = 45000;
-
-async function fetchPoToken() {
-  try {
-    const resp = await fetchWithTimeout(POT_PROVIDER_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({}),
-    }, POT_FETCH_TIMEOUT_MS);
-    if (!resp.ok) return null;
-    const data = await resp.json().catch(() => null);
-    // The server returns { poToken, visitorData } per the documented
-    // /get_pot contract — this shape has been stable across the 1.x
-    // TypeScript server releases used here (as opposed to the newer Rust
-    // rewrite, which this Docker image is NOT — brainicism/bgutil-ytdlp-
-    // pot-provider:latest is the TypeScript/Node implementation).
-    if (data?.poToken) {
-      return { poToken: data.poToken, visitorData: data.visitorData || null };
-    }
-    return null;
-  } catch (_) {
-    return null;
-  }
-}
+const POT_FETCH_TIMEOUT_MS = 3000;
 
 async function fetchWithTimeout(url, options, timeoutMs = FETCH_TIMEOUT_MS) {
   const controller = new AbortController();
@@ -100,12 +67,104 @@ async function fetchWithTimeout(url, options, timeoutMs = FETCH_TIMEOUT_MS) {
   }
 }
 
+// A small deadline helper: wraps a promise so it never keeps the caller
+// waiting past `msLeft`. Used to enforce TOTAL_RESOLVE_BUDGET_MS across the
+// whole chain, not just per-request.
+function withDeadline(promise, msLeft, fallbackValue = null) {
+  if (msLeft <= 0) return Promise.resolve(fallbackValue);
+  return Promise.race([
+    promise,
+    new Promise((resolve) => setTimeout(() => resolve(fallbackValue), msLeft)),
+  ]);
+}
+
+async function fetchPoToken() {
+  try {
+    const resp = await fetchWithTimeout(POT_PROVIDER_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    }, POT_FETCH_TIMEOUT_MS);
+    if (!resp.ok) return null;
+    const data = await resp.json().catch(() => null);
+    if (data?.poToken) {
+      return { poToken: data.poToken, visitorData: data.visitorData || null };
+    }
+    return null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// Fire-and-forget ping to keep/wake the Render instance, WITHOUT the
+// current request waiting on it. Callers should NOT await this — it's
+// deliberately detached so a cold provider only costs future requests a
+// warmer instance, never the current one extra latency. Cloudflare's
+// `ctx.waitUntil` (passed in as `waitUntil`) lets this keep running after
+// the response has already been sent back to the client.
+function keepAlivePot(waitUntil) {
+  const ping = fetch(POT_PROVIDER_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({}),
+  }).catch(() => null);
+  if (waitUntil) waitUntil(ping);
+}
+
 // =============================================================================
-// ATTEMPT 1 — ANDROID_VR, retried up to 3x for the SABR-only flakiness.
-// Returns the full playerResponse json, or null if all retries failed
-// to produce a response with an actually-usable audio URL.
+// ATTEMPT — PO-Token-backed WEB_EMBEDDED_PLAYER. Only used when a token
+// was actually obtained within POT_FETCH_TIMEOUT_MS.
+//
+// PO Tokens are platform-bound — a bgutil (BotGuard/web) token is valid for
+// WEB_EMBEDDED_PLAYER, not ANDROID_VR (DroidGuard) or IOS. This client is
+// the one it's actually meant for.
 // =============================================================================
-async function ytAndroidVr(videoId, attempts = 3) {
+async function ytWebEmbeddedWithPot(videoId, pot, timeoutMs) {
+  if (!pot?.poToken) return null;
+  try {
+    const context = {
+      client: {
+        clientName: 'WEB_EMBEDDED_PLAYER',
+        clientVersion: '1.20250101.00.00',
+        hl: 'en',
+        gl: 'US',
+      },
+      thirdParty: { embedUrl: `https://www.youtube.com/watch?v=${videoId}` },
+    };
+    if (pot.visitorData) context.client.visitorData = pot.visitorData;
+
+    const resp = await fetchWithTimeout('https://www.youtube.com/youtubei/v1/player', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      },
+      body: JSON.stringify({
+        videoId,
+        context,
+        serviceIntegrityDimensions: { poToken: pot.poToken },
+      }),
+    }, timeoutMs);
+    const json = await resp.json().catch(() => null);
+    if (json?.playabilityStatus?.status === 'OK') {
+      const hasUsableAudio = (json?.streamingData?.adaptiveFormats || [])
+        .some((f) => f.url && f.mimeType?.includes('audio'));
+      if (hasUsableAudio) return json;
+    }
+    return null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// =============================================================================
+// ATTEMPT — ANDROID_VR, retried a couple times for request-level flakiness
+// (YouTube's SABR-only A/B experiment causes intermittent empty `url`
+// fields on some requests for the same video). Trimmed to 2 attempts (was
+// 3) so it fits comfortably inside the overall budget alongside everything
+// else.
+// =============================================================================
+async function ytAndroidVr(videoId, attempts, perAttemptTimeoutMs) {
   for (let i = 0; i < attempts; i++) {
     try {
       const resp = await fetchWithTimeout('https://www.youtube.com/youtubei/v1/player', {
@@ -128,7 +187,7 @@ async function ytAndroidVr(videoId, attempts = 3) {
             },
           },
         }),
-      });
+      }, perAttemptTimeoutMs);
       const json = await resp.json().catch(() => null);
       if (json?.playabilityStatus?.status === 'OK') {
         const hasUsableAudio = (json?.streamingData?.adaptiveFormats || [])
@@ -143,65 +202,9 @@ async function ytAndroidVr(videoId, attempts = 3) {
 }
 
 // =============================================================================
-// PO-TOKEN-BACKED WEB_EMBEDDED_PLAYER attempt — this is the one that can
-// actually use the bgutil PO Token correctly.
-//
-// CRITICAL CORRECTION: PO Tokens are platform-bound — a token from
-// BotGuard (web-based attestation, which is what our bgutil provider runs)
-// literally cannot be used with ANDROID_VR (which is authenticated via
-// DroidGuard, a different attestation system entirely). Attaching the
-// bgutil token to the ANDROID_VR request in the first version of this fix
-// was invalid by construction, which is why it made no difference. Source:
-// yt-dlp's own PO Token Guide — "A PO Token from one platform cannot be
-// used on another (i.e., Web PO Token cannot be used on Android or iOS)."
-// The web-family client this token IS valid for is WEB_EMBEDDED_PLAYER,
-// so that's the client this attempt uses.
+// ATTEMPT — iOS client.
 // =============================================================================
-async function ytWebEmbeddedWithPot(videoId, pot) {
-  if (!pot?.poToken) return null;
-  try {
-    const context = {
-      client: {
-        clientName: 'WEB_EMBEDDED_PLAYER',
-        clientVersion: '1.20250101.00.00',
-        hl: 'en',
-        gl: 'US',
-      },
-      thirdParty: {
-        embedUrl: `https://www.youtube.com/watch?v=${videoId}`,
-      },
-    };
-    if (pot.visitorData) {
-      context.client.visitorData = pot.visitorData;
-    }
-    const resp = await fetchWithTimeout('https://www.youtube.com/youtubei/v1/player', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-      },
-      body: JSON.stringify({
-        videoId,
-        context,
-        serviceIntegrityDimensions: { poToken: pot.poToken },
-      }),
-    });
-    const json = await resp.json().catch(() => null);
-    if (json?.playabilityStatus?.status === 'OK') {
-      const hasUsableAudio = (json?.streamingData?.adaptiveFormats || [])
-        .some((f) => f.url && f.mimeType?.includes('audio'));
-      if (hasUsableAudio) return json;
-    }
-    return null;
-  } catch (_) {
-    return null;
-  }
-}
-
-// =============================================================================
-// ATTEMPT 2 — iOS client (only reached if ANDROID_VR exhausted its retries).
-// =============================================================================
-async function ytIos(videoId) {
+async function ytIos(videoId, timeoutMs) {
   try {
     const resp = await fetchWithTimeout('https://www.youtube.com/youtubei/v1/player', {
       method: 'POST',
@@ -223,7 +226,7 @@ async function ytIos(videoId) {
           },
         },
       }),
-    });
+    }, timeoutMs);
     const json = await resp.json().catch(() => null);
     if (json?.playabilityStatus?.status === 'OK') {
       const hasUsableAudio = (json?.streamingData?.adaptiveFormats || [])
@@ -237,9 +240,9 @@ async function ytIos(videoId) {
 }
 
 // =============================================================================
-// ATTEMPT 3 — TVHTML5_SIMPLY_EMBEDDED_PLAYER bypass.
+// ATTEMPT — TVHTML5_SIMPLY_EMBEDDED_PLAYER bypass.
 // =============================================================================
-async function ytTvEmbeddedBypass(videoId) {
+async function ytTvEmbeddedBypass(videoId, timeoutMs) {
   try {
     const resp = await fetchWithTimeout('https://www.youtube.com/youtubei/v1/player', {
       method: 'POST',
@@ -259,12 +262,10 @@ async function ytTvEmbeddedBypass(videoId) {
             hl: 'en',
             gl: 'US',
           },
-          thirdParty: {
-            embedUrl: `https://www.youtube.com/watch?v=${videoId}`,
-          },
+          thirdParty: { embedUrl: `https://www.youtube.com/watch?v=${videoId}` },
         },
       }),
-    });
+    }, timeoutMs);
     return await resp.json().catch(() => null);
   } catch (_) {
     return null;
@@ -272,16 +273,16 @@ async function ytTvEmbeddedBypass(videoId) {
 }
 
 // =============================================================================
-// ATTEMPT 4 — Piped, tried across multiple instances in sequence until one
-// responds with usable audio streams. CLOSEST-bitrate match, applied to
-// both adaptiveFormats and formats (muxed).
+// ATTEMPT — Piped, tried across multiple instances in sequence until one
+// responds with usable audio streams.
 // =============================================================================
-async function ytPipedFallback(videoId, safePlayerResponse) {
+async function ytPipedFallback(videoId, safePlayerResponse, perInstanceTimeoutMs, deadlineAt) {
   for (const instance of PIPED_INSTANCES) {
+    if (Date.now() > deadlineAt) break; // out of overall budget — stop trying more instances
     try {
       const resp = await fetchWithTimeout(`${instance}/streams/${videoId}`, {
         headers: { 'Content-Type': 'application/json' },
-      }, 5000);
+      }, perInstanceTimeoutMs);
       if (!resp.ok) continue;
       const pipedData = await resp.json().catch(() => null);
       const audioStreams = pipedData?.audioStreams || [];
@@ -304,11 +305,6 @@ async function ytPipedFallback(videoId, safePlayerResponse) {
           return { ...f, url: match ? match.url : f.url };
         });
       } else {
-        // No prior playerResponse at all (every YT client attempt failed
-        // outright) — build a minimal adaptiveFormats list straight from
-        // Piped's own audio streams so extractAudioUrl() still has
-        // something to pick from, instead of returning nothing just
-        // because there was no earlier "safe" response to graft onto.
         merged.streamingData = merged.streamingData || {};
         merged.streamingData.adaptiveFormats = audioStreams
           .filter((s) => s.url)
@@ -325,52 +321,60 @@ async function ytPipedFallback(videoId, safePlayerResponse) {
       continue;
     }
   }
-  // Every Piped instance failed or timed out — return whatever we had
-  // before trying Piped (may be null), so the caller can still report a
-  // clear "nothing worked" rather than throwing.
   return safePlayerResponse;
 }
 
 // =============================================================================
-// MAIN resolve.
+// MAIN resolve — every stage now runs against a shared deadline so the
+// WHOLE function can never exceed TOTAL_RESOLVE_BUDGET_MS, regardless of
+// how many clients/instances are configured above.
 // =============================================================================
-async function resolveYtStream(videoId) {
-  // Fetch a PO Token first. If the provider is cold/asleep/down, this
-  // returns null after its own timeout, and everything below proceeds
-  // exactly as it did before the PO Token was introduced.
-  const pot = await fetchPoToken();
+async function resolveYtStream(videoId, waitUntil) {
+  const startedAt = Date.now();
+  const deadlineAt = startedAt + TOTAL_RESOLVE_BUDGET_MS;
+  const remaining = () => Math.max(0, deadlineAt - Date.now());
 
-  // Try the PO-Token-backed WEB_EMBEDDED_PLAYER attempt first when we
-  // have a token — this is the only client in this chain a bgutil
-  // (BotGuard/web) token is actually valid for, so it's the one with the
-  // real shot at bypassing bot detection.
-  if (pot?.poToken) {
-    const webResponse = await ytWebEmbeddedWithPot(videoId, pot);
-    if (webResponse) {
-      return extractAudioUrl(webResponse);
-    }
+  // Kick off a detached keep-alive ping so future requests have a better
+  // shot at a warm PO Token provider. Not awaited — costs this request
+  // nothing.
+  keepAlivePot(waitUntil);
+
+  // PO Token fetch is capped hard at 3s and does NOT block beyond that,
+  // regardless of provider cold-start time.
+  const pot = await withDeadline(fetchPoToken(), Math.min(POT_FETCH_TIMEOUT_MS, remaining()));
+
+  if (pot?.poToken && remaining() > 0) {
+    const webResponse = await ytWebEmbeddedWithPot(videoId, pot, Math.min(FETCH_TIMEOUT_MS, remaining()));
+    if (webResponse) return extractAudioUrl(webResponse);
   }
 
-  const androidVrResponse = await ytAndroidVr(videoId, 3);
-  if (androidVrResponse) {
-    return extractAudioUrl(androidVrResponse);
+  if (remaining() > 0) {
+    const androidVrResponse = await ytAndroidVr(videoId, 2, Math.min(FETCH_TIMEOUT_MS, Math.max(1500, remaining() / 3)));
+    if (androidVrResponse) return extractAudioUrl(androidVrResponse);
   }
 
-  const iosResponse = await ytIos(videoId);
-  if (iosResponse) {
-    return extractAudioUrl(iosResponse);
+  if (remaining() > 0) {
+    const iosResponse = await ytIos(videoId, Math.min(FETCH_TIMEOUT_MS, remaining()));
+    if (iosResponse) return extractAudioUrl(iosResponse);
   }
 
-  const safePlayerResponse = await ytTvEmbeddedBypass(videoId);
-  if (safePlayerResponse?.playabilityStatus?.status !== 'OK') {
-    // Nothing from any direct YT client worked — last resort is Piped,
-    // built from scratch if needed (see ytPipedFallback's else-branch).
-    const pipedOnly = await ytPipedFallback(videoId, null);
-    return extractAudioUrl(pipedOnly);
+  let safePlayerResponse = null;
+  if (remaining() > 0) {
+    safePlayerResponse = await ytTvEmbeddedBypass(videoId, Math.min(FETCH_TIMEOUT_MS, remaining()));
   }
 
-  const withPiped = await ytPipedFallback(videoId, safePlayerResponse);
-  return extractAudioUrl(withPiped);
+  if (remaining() > 0) {
+    const withPiped = await ytPipedFallback(
+      videoId,
+      safePlayerResponse?.playabilityStatus?.status === 'OK' ? safePlayerResponse : null,
+      Math.min(4000, remaining()),
+      deadlineAt
+    );
+    const result = extractAudioUrl(withPiped);
+    if (result) return result;
+  }
+
+  return null;
 }
 
 function extractAudioUrl(playerResponse) {
@@ -385,11 +389,8 @@ function extractAudioUrl(playerResponse) {
       mimeType: audioFormats[0].mimeType,
     };
   }
-  // Fallback to muxed formats if no audio-only format resolved.
   const muxed = playerResponse?.streamingData?.formats || [];
-  const muxedSorted = muxed
-    .filter((f) => f.url)
-    .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+  const muxedSorted = muxed.filter((f) => f.url).sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
   if (muxedSorted.length) {
     return {
       url: muxedSorted[0].url,
@@ -402,18 +403,18 @@ function extractAudioUrl(playerResponse) {
 }
 
 // =============================================================================
-// Route handlers — no caching, no coalescing.
+// Route handlers
 // =============================================================================
-async function handleYtStream(videoId) {
+async function handleYtStream(videoId, waitUntil) {
   if (!videoId) return jsonResp({ success: false, error: 'id required' }, 400);
-  const audio = await resolveYtStream(videoId);
+  const audio = await resolveYtStream(videoId, waitUntil);
   if (!audio) return jsonResp({ success: false, error: 'No stream found' }, 502);
   return jsonResp({ success: true, ...audio, videoId });
 }
 
-async function handleYtProxy(videoId, request) {
+async function handleYtProxy(videoId, request, waitUntil) {
   if (!videoId) return new Response('id required', { status: 400 });
-  const audio = await resolveYtStream(videoId);
+  const audio = await resolveYtStream(videoId, waitUntil);
   if (!audio?.url) return new Response('Could not resolve stream', { status: 502 });
 
   const rangeHeader = request.headers.get('Range');
@@ -634,8 +635,9 @@ function jsonResp(data, status = 200) {
 // Main router
 // =============================================================================
 export default {
-  async fetch(request) {
+  async fetch(request, env, ctx) {
     const { pathname, searchParams } = new URL(request.url);
+    const waitUntil = ctx?.waitUntil?.bind(ctx);
 
     if (request.method === 'OPTIONS') {
       return new Response(null, {
@@ -648,8 +650,8 @@ export default {
       });
     }
 
-    if (pathname === '/api/yt-stream') return handleYtStream(searchParams.get('id') || '');
-    if (pathname === '/api/yt-proxy') return handleYtProxy(searchParams.get('id') || '', request);
+    if (pathname === '/api/yt-stream') return handleYtStream(searchParams.get('id') || '', waitUntil);
+    if (pathname === '/api/yt-proxy') return handleYtProxy(searchParams.get('id') || '', request, waitUntil);
 
     if (pathname === '/result/') return handleSaavnSearch(searchParams.get('query') || '', searchParams.get('limit') || '20');
     if (pathname === '/song/') return handleSaavnStream(searchParams.get('id') || '');
@@ -659,15 +661,18 @@ export default {
     if (pathname === '/health') {
       return jsonResp({
         status: 'ok',
-        worker: 'aurum-musicyou-pattern',
+        worker: 'aurum-stable-v2-budgeted',
         potProvider: POT_PROVIDER_URL,
+        totalResolveBudgetMs: TOTAL_RESOLVE_BUDGET_MS,
+        potFetchTimeoutMs: POT_FETCH_TIMEOUT_MS,
         ytClients: [
-          'ANDROID_VR (up to 3 retries, PO-Token-attached when provider is up)',
-          'IOS (middle fallback)',
+          'WEB_EMBEDDED_PLAYER (PO-Token, only if token obtained within 3s)',
+          'ANDROID_VR (2 retries)',
+          'IOS',
           'TVHTML5_SIMPLY_EMBEDDED_PLAYER (bypass)',
           `Piped closest-bitrate (multi-instance: ${PIPED_INSTANCES.join(', ')})`,
         ],
-        resolutionStrategy: 'PO-Token-first, retry-hardened sequential chain, no cache, no coalescing',
+        resolutionStrategy: 'budgeted sequential chain — hard 15s cap, PO Token non-blocking',
       });
     }
 
