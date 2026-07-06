@@ -50,6 +50,46 @@ const PIPED_INSTANCES = [
 
 const FETCH_TIMEOUT_MS = 6000;
 
+// PO Token provider — self-hosted bgutil-ytdlp-pot-provider on Render.
+// This is what actually gets past YouTube's bot-check consistently;
+// everything else in this file (client rotation, retries, Piped) was the
+// best available approach WITHOUT a PO Token, which is why it still failed
+// on most videos. A PO Token proves the request came from a real BotGuard
+// attestation flow instead of a bare HTTP client.
+//
+// IMPORTANT — this is a free-tier Render service: it spins down after
+// inactivity and the first request after idle can take 30-50s to wake up.
+// POT_FETCH_TIMEOUT_MS is intentionally longer than the YT-client timeout
+// to give a cold-started instance a chance, but if it's still not up in
+// time, we fall through to the existing no-PoToken chain rather than
+// failing the whole request — a slow/asleep POT provider should degrade
+// to "old behavior," not "total failure."
+const POT_PROVIDER_URL = 'https://aurum-pot.onrender.com/get_pot';
+const POT_FETCH_TIMEOUT_MS = 45000;
+
+async function fetchPoToken() {
+  try {
+    const resp = await fetchWithTimeout(POT_PROVIDER_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    }, POT_FETCH_TIMEOUT_MS);
+    if (!resp.ok) return null;
+    const data = await resp.json().catch(() => null);
+    // The server returns { poToken, visitorData } per the documented
+    // /get_pot contract — this shape has been stable across the 1.x
+    // TypeScript server releases used here (as opposed to the newer Rust
+    // rewrite, which this Docker image is NOT — brainicism/bgutil-ytdlp-
+    // pot-provider:latest is the TypeScript/Node implementation).
+    if (data?.poToken) {
+      return { poToken: data.poToken, visitorData: data.visitorData || null };
+    }
+    return null;
+  } catch (_) {
+    return null;
+  }
+}
+
 async function fetchWithTimeout(url, options, timeoutMs = FETCH_TIMEOUT_MS) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -65,9 +105,37 @@ async function fetchWithTimeout(url, options, timeoutMs = FETCH_TIMEOUT_MS) {
 // Returns the full playerResponse json, or null if all retries failed
 // to produce a response with an actually-usable audio URL.
 // =============================================================================
-async function ytAndroidVr(videoId, attempts = 3) {
+async function ytAndroidVr(videoId, attempts = 3, pot = null) {
   for (let i = 0; i < attempts; i++) {
     try {
+      const context = {
+        client: {
+          clientName: 'ANDROID_VR',
+          clientVersion: '1.71.26',
+          osVersion: '12L',
+          hl: 'en',
+          gl: 'US',
+        },
+      };
+      // Attach visitorData if the POT provider gave us one — InnerTube
+      // uses this to correlate the session the PO Token was minted for.
+      if (pot?.visitorData) {
+        context.client.visitorData = pot.visitorData;
+      }
+
+      const body = { videoId, context };
+      // serviceIntegrityDimensions.poToken is where YouTube's InnerTube
+      // player endpoint expects the PO Token (per the yt-dlp POT-provider
+      // integration this server implements the other half of). This is
+      // an undocumented Google-internal field name, so it can change
+      // without notice — if requests start failing again after working,
+      // this is the first thing to re-verify against a current yt-dlp
+      // debug log (yt-dlp -v with bgutil configured shows the exact
+      // request shape it sends).
+      if (pot?.poToken) {
+        body.serviceIntegrityDimensions = { poToken: pot.poToken };
+      }
+
       const resp = await fetchWithTimeout('https://www.youtube.com/youtubei/v1/player', {
         method: 'POST',
         headers: {
@@ -76,18 +144,7 @@ async function ytAndroidVr(videoId, attempts = 3) {
           'X-YouTube-Client-Name': '28',
           'X-YouTube-Client-Version': '1.71.26',
         },
-        body: JSON.stringify({
-          videoId,
-          context: {
-            client: {
-              clientName: 'ANDROID_VR',
-              clientVersion: '1.71.26',
-              osVersion: '12L',
-              hl: 'en',
-              gl: 'US',
-            },
-          },
-        }),
+        body: JSON.stringify(body),
       });
       const json = await resp.json().catch(() => null);
       if (json?.playabilityStatus?.status === 'OK') {
@@ -244,7 +301,15 @@ async function ytPipedFallback(videoId, safePlayerResponse) {
 // MAIN resolve.
 // =============================================================================
 async function resolveYtStream(videoId) {
-  const androidVrResponse = await ytAndroidVr(videoId);
+  // Fetch a PO Token first. If the provider is cold/asleep/down, this
+  // returns null after its own timeout, and everything below proceeds
+  // exactly as it did before the PO Token was introduced — this is an
+  // enhancement layered on top of the existing chain, not a replacement
+  // for it, so a POT-provider outage can't take down YouTube playback
+  // entirely.
+  const pot = await fetchPoToken();
+
+  const androidVrResponse = await ytAndroidVr(videoId, 3, pot);
   if (androidVrResponse) {
     return extractAudioUrl(androidVrResponse);
   }
@@ -553,13 +618,14 @@ export default {
       return jsonResp({
         status: 'ok',
         worker: 'aurum-musicyou-pattern',
+        potProvider: POT_PROVIDER_URL,
         ytClients: [
-          'ANDROID_VR (up to 3 retries — SABR-only experiment mitigation)',
+          'ANDROID_VR (up to 3 retries, PO-Token-attached when provider is up)',
           'IOS (middle fallback)',
           'TVHTML5_SIMPLY_EMBEDDED_PLAYER (bypass)',
           `Piped closest-bitrate (multi-instance: ${PIPED_INSTANCES.join(', ')})`,
         ],
-        resolutionStrategy: 'retry-hardened sequential chain, no cache, no coalescing',
+        resolutionStrategy: 'PO-Token-first, retry-hardened sequential chain, no cache, no coalescing',
       });
     }
 
