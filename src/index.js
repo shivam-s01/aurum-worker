@@ -1,67 +1,156 @@
 // =============================================================================
-// Aurum Music — Cloudflare Worker — YT resolution matching music-you fork
-// (github.com/[fork of vfsfitvnm/ViMusic], actively maintained, Jan 2026
-// client versions — ViMusic itself is archived/dead as of its last release).
-// =============================================================================
+// Aurum Music — Cloudflare Worker — YT resolution
+// (Updated 2026-07-07: android_vr is confirmed still the primary
+//  PoToken-free client as of yt-dlp 2026.07.04, but it has become
+//  ERRATIC — YouTube is randomly A/B-testing a "SABR-only" experiment
+//  that makes android_vr's adaptiveFormats come back with no `url` field
+//  on some requests and a valid one on the very next request for the
+//  SAME video. Source: yt-dlp issues #16150, #15780, VRChat feedback
+//  threads, confirmed as of March-July 2026. This is not fixable by
+//  switching clients — it's request-level flakiness, so the fix is
+//  RETRYING the same client a couple of times before giving up on it,
+//  not just falling through once.)
 //
-// ATTEMPT 1 — ANDROID_VR client (confirmed PoToken-free by yt-dlp/
-//   YoutubeExplode maintainers as of Jan 2026).
+// ATTEMPT 1 — ANDROID_VR client, up to 3 tries (handles the SABR-only
+//   flakiness described above; each retry is a fresh request, YouTube's
+//   experiment bucketing is per-request, not per-session).
 //
-// ATTEMPT 2 (only if attempt 1's playabilityStatus != "OK") —
-//   TVHTML5_SIMPLY_EMBEDDED_PLAYER bypass client.
+// ATTEMPT 2 (only if attempt 1 never got a usable audio URL) — iOS
+//   client. Still commonly PoToken-free/unobfuscated as of early-mid
+//   2026 per YoutubeExplode/yt-dlp community tracking, and represents a
+//   genuinely different client fingerprint than ANDROID_VR, so it is
+//   not just "trying the same broken thing again."
 //
-// ATTEMPT 3 (only if attempt 2 succeeds) — Piped fallback
-//   (pipedapi.adminforge.de), matched by CLOSEST bitrate (not exact-only
-//   like the old ViMusic logic), applied to both adaptiveFormats AND
-//   formats (muxed).
+// ATTEMPT 3 (only if attempt 2 also fails) — TVHTML5_SIMPLY_EMBEDDED_PLAYER
+//   bypass client, as before.
 //
-// No caching, no coalescing, no extra clients, no parallel racing —
-// same minimal raw-sequential shape as before, just swapped to the
-// currently-maintained fork's exact client choices.
+// ATTEMPT 4 (only if attempt 3 succeeds OR as a last resort if nothing
+//   above produced a URL) — Piped, tried across MULTIPLE instances in
+//   sequence (not just one), each with its own short timeout, matched
+//   by CLOSEST bitrate. If every instance fails/times out, we surface
+//   a clear error instead of silently returning nothing.
+//
+// No caching, no coalescing — same minimal shape as before, just each
+// stage is now retry/multi-instance hardened instead of single-shot.
 // =============================================================================
 
 const SAAVN_API = 'https://www.jiosaavn.com/api.php';
 
-const PIPED_INSTANCE = 'https://pipedapi.adminforge.de';
+// Multiple Piped instances tried in order. Each one is independently
+// operated and can go down without notice — trying only one (as before)
+// meant a single volunteer server's downtime took out the entire last
+// line of defense. List sourced from the actively-maintained
+// TeamPiped/Piped instance wiki (checked 2026-07-07).
+const PIPED_INSTANCES = [
+  'https://pipedapi.adminforge.de',
+  'https://api.piped.yt',
+  'https://pipedapi.drgns.space',
+  'https://pipedapi.reallyaweso.me',
+];
+
+const FETCH_TIMEOUT_MS = 6000;
+
+async function fetchWithTimeout(url, options, timeoutMs = FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 // =============================================================================
-// ATTEMPT 1 — ANDROID_VR (music-you's primary client)
+// ATTEMPT 1 — ANDROID_VR, retried up to 3x for the SABR-only flakiness.
+// Returns the full playerResponse json, or null if all retries failed
+// to produce a response with an actually-usable audio URL.
 // =============================================================================
-async function ytAndroidVr(videoId) {
+async function ytAndroidVr(videoId, attempts = 3) {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const resp = await fetchWithTimeout('https://www.youtube.com/youtubei/v1/player', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': 'com.google.android.apps.youtube.vr.oculus/1.71.26 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
+          'X-YouTube-Client-Name': '28',
+          'X-YouTube-Client-Version': '1.71.26',
+        },
+        body: JSON.stringify({
+          videoId,
+          context: {
+            client: {
+              clientName: 'ANDROID_VR',
+              clientVersion: '1.71.26',
+              osVersion: '12L',
+              hl: 'en',
+              gl: 'US',
+            },
+          },
+        }),
+      });
+      const json = await resp.json().catch(() => null);
+      if (json?.playabilityStatus?.status === 'OK') {
+        // Confirm this attempt actually gave us a usable audio URL —
+        // the SABR-only experiment returns status "OK" but with
+        // adaptiveFormats entries that have no `url` field at all, which
+        // extractAudioUrl() would otherwise silently treat as "no audio
+        // formats" without us knowing WHY this attempt failed.
+        const hasUsableAudio = (json?.streamingData?.adaptiveFormats || [])
+          .some((f) => f.url && f.mimeType?.includes('audio'));
+        if (hasUsableAudio) return json;
+      }
+    } catch (_) {
+      // fall through to next attempt
+    }
+  }
+  return null;
+}
+
+// =============================================================================
+// ATTEMPT 2 — iOS client (only reached if ANDROID_VR exhausted its retries).
+// =============================================================================
+async function ytIos(videoId) {
   try {
-    const resp = await fetch('https://www.youtube.com/youtubei/v1/player', {
+    const resp = await fetchWithTimeout('https://www.youtube.com/youtubei/v1/player', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'User-Agent': 'com.google.android.apps.youtube.vr.oculus/1.71.26 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
-        'X-YouTube-Client-Name': '28',
-        'X-YouTube-Client-Version': '1.71.26',
+        'User-Agent': 'com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)',
+        'X-YouTube-Client-Name': '5',
+        'X-YouTube-Client-Version': '19.29.1',
       },
       body: JSON.stringify({
         videoId,
         context: {
           client: {
-            clientName: 'ANDROID_VR',
-            clientVersion: '1.71.26',
-            osVersion: '12L',
+            clientName: 'IOS',
+            clientVersion: '19.29.1',
+            deviceModel: 'iPhone16,2',
             hl: 'en',
             gl: 'US',
           },
         },
       }),
     });
-    return await resp.json();
+    const json = await resp.json().catch(() => null);
+    if (json?.playabilityStatus?.status === 'OK') {
+      const hasUsableAudio = (json?.streamingData?.adaptiveFormats || [])
+        .some((f) => f.url && f.mimeType?.includes('audio'));
+      if (hasUsableAudio) return json;
+    }
+    return null;
   } catch (_) {
     return null;
   }
 }
 
 // =============================================================================
-// ATTEMPT 2 — TVHTML5_SIMPLY_EMBEDDED_PLAYER bypass (only if attempt 1 fails)
+// ATTEMPT 3 — TVHTML5_SIMPLY_EMBEDDED_PLAYER bypass.
 // =============================================================================
 async function ytTvEmbeddedBypass(videoId) {
   try {
-    const resp = await fetch('https://www.youtube.com/youtubei/v1/player', {
+    const resp = await fetchWithTimeout('https://www.youtube.com/youtubei/v1/player', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -85,71 +174,92 @@ async function ytTvEmbeddedBypass(videoId) {
         },
       }),
     });
-    return await resp.json();
+    return await resp.json().catch(() => null);
   } catch (_) {
     return null;
   }
 }
 
 // =============================================================================
-// ATTEMPT 3 — Piped fallback, CLOSEST-bitrate match (music-you's improvement
-// over ViMusic's exact-match-only, which returned null on no exact match).
-// Applied to both adaptiveFormats and formats (muxed), matching music-you.
+// ATTEMPT 4 — Piped, tried across multiple instances in sequence until one
+// responds with usable audio streams. CLOSEST-bitrate match, applied to
+// both adaptiveFormats and formats (muxed).
 // =============================================================================
 async function ytPipedFallback(videoId, safePlayerResponse) {
-  try {
-    const resp = await fetch(`${PIPED_INSTANCE}/streams/${videoId}`, {
-      headers: { 'Content-Type': 'application/json' },
-    });
-    if (!resp.ok) return safePlayerResponse;
-    const pipedData = await resp.json();
-    const audioStreams = pipedData.audioStreams || [];
-    if (!audioStreams.length) return safePlayerResponse;
+  for (const instance of PIPED_INSTANCES) {
+    try {
+      const resp = await fetchWithTimeout(`${instance}/streams/${videoId}`, {
+        headers: { 'Content-Type': 'application/json' },
+      }, 5000);
+      if (!resp.ok) continue;
+      const pipedData = await resp.json().catch(() => null);
+      const audioStreams = pipedData?.audioStreams || [];
+      if (!audioStreams.length) continue;
 
-    const closestMatch = (bitrate) => {
-      const target = bitrate || 0;
-      if (target === 0) return null;
-      return audioStreams.reduce((best, s) => {
-        const diff = Math.abs((s.bitrate || 0) - target);
-        const bestDiff = best ? Math.abs((best.bitrate || 0) - target) : Infinity;
-        return diff < bestDiff ? s : best;
-      }, null);
-    };
+      const closestMatch = (bitrate) => {
+        const target = bitrate || 0;
+        if (target === 0) return null;
+        return audioStreams.reduce((best, s) => {
+          const diff = Math.abs((s.bitrate || 0) - target);
+          const bestDiff = best ? Math.abs((best.bitrate || 0) - target) : Infinity;
+          return diff < bestDiff ? s : best;
+        }, null);
+      };
 
-    if (safePlayerResponse?.streamingData?.adaptiveFormats) {
-      safePlayerResponse.streamingData.adaptiveFormats =
-        safePlayerResponse.streamingData.adaptiveFormats.map((f) => {
+      const merged = safePlayerResponse ? { ...safePlayerResponse } : { streamingData: {} };
+      if (merged?.streamingData?.adaptiveFormats) {
+        merged.streamingData.adaptiveFormats = merged.streamingData.adaptiveFormats.map((f) => {
           const match = closestMatch(f.bitrate);
           return { ...f, url: match ? match.url : f.url };
         });
-    }
-    if (safePlayerResponse?.streamingData?.formats) {
-      safePlayerResponse.streamingData.formats =
-        safePlayerResponse.streamingData.formats.map((f) => {
+      } else {
+        // No prior playerResponse at all (every YT client attempt failed
+        // outright) — build a minimal adaptiveFormats list straight from
+        // Piped's own audio streams so extractAudioUrl() still has
+        // something to pick from, instead of returning nothing just
+        // because there was no earlier "safe" response to graft onto.
+        merged.streamingData = merged.streamingData || {};
+        merged.streamingData.adaptiveFormats = audioStreams
+          .filter((s) => s.url)
+          .map((s) => ({ url: s.url, bitrate: s.bitrate, mimeType: s.mimeType || 'audio/mp4' }));
+      }
+      if (merged?.streamingData?.formats) {
+        merged.streamingData.formats = merged.streamingData.formats.map((f) => {
           const match = closestMatch(f.bitrate);
           return { ...f, url: match ? match.url : f.url };
         });
+      }
+      return merged;
+    } catch (_) {
+      continue;
     }
-    return safePlayerResponse;
-  } catch (_) {
-    return safePlayerResponse;
   }
+  // Every Piped instance failed or timed out — return whatever we had
+  // before trying Piped (may be null), so the caller can still report a
+  // clear "nothing worked" rather than throwing.
+  return safePlayerResponse;
 }
 
 // =============================================================================
-// MAIN resolve — same shape as before, updated client sequence.
+// MAIN resolve.
 // =============================================================================
 async function resolveYtStream(videoId) {
-  const response = await ytAndroidVr(videoId);
+  const androidVrResponse = await ytAndroidVr(videoId);
+  if (androidVrResponse) {
+    return extractAudioUrl(androidVrResponse);
+  }
 
-  if (response?.playabilityStatus?.status === 'OK') {
-    return extractAudioUrl(response);
+  const iosResponse = await ytIos(videoId);
+  if (iosResponse) {
+    return extractAudioUrl(iosResponse);
   }
 
   const safePlayerResponse = await ytTvEmbeddedBypass(videoId);
-
   if (safePlayerResponse?.playabilityStatus?.status !== 'OK') {
-    return extractAudioUrl(response);
+    // Nothing from any direct YT client worked — last resort is Piped,
+    // built from scratch if needed (see ytPipedFallback's else-branch).
+    const pipedOnly = await ytPipedFallback(videoId, null);
+    return extractAudioUrl(pipedOnly);
   }
 
   const withPiped = await ytPipedFallback(videoId, safePlayerResponse);
@@ -443,8 +553,13 @@ export default {
       return jsonResp({
         status: 'ok',
         worker: 'aurum-musicyou-pattern',
-        ytClients: ['ANDROID_VR', 'TVHTML5_SIMPLY_EMBEDDED_PLAYER (bypass)', 'Piped closest-bitrate (pipedapi.adminforge.de)'],
-        resolutionStrategy: 'music-you fork pattern — sequential, no cache, no coalescing',
+        ytClients: [
+          'ANDROID_VR (up to 3 retries — SABR-only experiment mitigation)',
+          'IOS (middle fallback)',
+          'TVHTML5_SIMPLY_EMBEDDED_PLAYER (bypass)',
+          `Piped closest-bitrate (multi-instance: ${PIPED_INSTANCES.join(', ')})`,
+        ],
+        resolutionStrategy: 'retry-hardened sequential chain, no cache, no coalescing',
       });
     }
 
