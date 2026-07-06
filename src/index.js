@@ -403,6 +403,159 @@ function extractAudioUrl(playerResponse) {
 }
 
 // =============================================================================
+// DEBUG — runs every client independently (not budgeted, not short-circuited)
+// and reports what each one actually returned/threw. Use this to see WHICH
+// client is failing and why, since resolveYtStream() swallows all errors
+// via catch(_) { return null } for the normal fast-path.
+// =============================================================================
+async function handleDebugYt(videoId) {
+  if (!videoId) return jsonResp({ success: false, error: 'id required' }, 400);
+  const report = {};
+
+  // PO Token
+  const potStart = Date.now();
+  let pot = null;
+  try {
+    pot = await fetchPoToken();
+    report.poToken = { ok: !!pot?.poToken, tookMs: Date.now() - potStart, hasVisitorData: !!pot?.visitorData };
+  } catch (e) {
+    report.poToken = { ok: false, tookMs: Date.now() - potStart, error: String(e) };
+  }
+
+  // WEB_EMBEDDED_PLAYER (only meaningful if we got a token)
+  if (pot?.poToken) {
+    const t0 = Date.now();
+    try {
+      const resp = await fetchWithTimeout('https://www.youtube.com/youtubei/v1/player', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        },
+        body: JSON.stringify({
+          videoId,
+          context: { client: { clientName: 'WEB_EMBEDDED_PLAYER', clientVersion: '1.20250101.00.00', hl: 'en', gl: 'US', ...(pot.visitorData ? { visitorData: pot.visitorData } : {}) }, thirdParty: { embedUrl: `https://www.youtube.com/watch?v=${videoId}` } },
+          serviceIntegrityDimensions: { poToken: pot.poToken },
+        }),
+      }, 6000);
+      const json = await resp.json().catch(() => null);
+      report.webEmbedded = {
+        httpStatus: resp.status,
+        playabilityStatus: json?.playabilityStatus?.status || null,
+        reason: json?.playabilityStatus?.reason || null,
+        formatCount: (json?.streamingData?.adaptiveFormats || []).length,
+        tookMs: Date.now() - t0,
+      };
+    } catch (e) {
+      report.webEmbedded = { error: String(e), tookMs: Date.now() - t0 };
+    }
+  } else {
+    report.webEmbedded = { skipped: 'no PO token' };
+  }
+
+  // ANDROID_VR
+  {
+    const t0 = Date.now();
+    try {
+      const resp = await fetchWithTimeout('https://www.youtube.com/youtubei/v1/player', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': 'com.google.android.apps.youtube.vr.oculus/1.71.26 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip',
+          'X-YouTube-Client-Name': '28',
+          'X-YouTube-Client-Version': '1.71.26',
+        },
+        body: JSON.stringify({ videoId, context: { client: { clientName: 'ANDROID_VR', clientVersion: '1.71.26', osVersion: '12L', hl: 'en', gl: 'US' } } }),
+      }, 6000);
+      const json = await resp.json().catch(() => null);
+      report.androidVr = {
+        httpStatus: resp.status,
+        playabilityStatus: json?.playabilityStatus?.status || null,
+        reason: json?.playabilityStatus?.reason || null,
+        formatCount: (json?.streamingData?.adaptiveFormats || []).length,
+        tookMs: Date.now() - t0,
+      };
+    } catch (e) {
+      report.androidVr = { error: String(e), tookMs: Date.now() - t0 };
+    }
+  }
+
+  // IOS
+  {
+    const t0 = Date.now();
+    try {
+      const resp = await fetchWithTimeout('https://www.youtube.com/youtubei/v1/player', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': 'com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)',
+          'X-YouTube-Client-Name': '5',
+          'X-YouTube-Client-Version': '19.29.1',
+        },
+        body: JSON.stringify({ videoId, context: { client: { clientName: 'IOS', clientVersion: '19.29.1', deviceModel: 'iPhone16,2', hl: 'en', gl: 'US' } } }),
+      }, 6000);
+      const json = await resp.json().catch(() => null);
+      report.ios = {
+        httpStatus: resp.status,
+        playabilityStatus: json?.playabilityStatus?.status || null,
+        reason: json?.playabilityStatus?.reason || null,
+        formatCount: (json?.streamingData?.adaptiveFormats || []).length,
+        tookMs: Date.now() - t0,
+      };
+    } catch (e) {
+      report.ios = { error: String(e), tookMs: Date.now() - t0 };
+    }
+  }
+
+  // TVHTML5_SIMPLY_EMBEDDED_PLAYER
+  {
+    const t0 = Date.now();
+    try {
+      const resp = await fetchWithTimeout('https://www.youtube.com/youtubei/v1/player', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': 'Mozilla/5.0 (PlayStation; PlayStation 4/12.02) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.4 Safari/605.1.15',
+          'X-YouTube-Client-Name': '85',
+          'X-YouTube-Client-Version': '2.0',
+        },
+        body: JSON.stringify({ videoId, context: { client: { clientName: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER', clientVersion: '2.0', platform: 'TV', hl: 'en', gl: 'US' }, thirdParty: { embedUrl: `https://www.youtube.com/watch?v=${videoId}` } } }),
+      }, 6000);
+      const json = await resp.json().catch(() => null);
+      report.tvEmbedded = {
+        httpStatus: resp.status,
+        playabilityStatus: json?.playabilityStatus?.status || null,
+        reason: json?.playabilityStatus?.reason || null,
+        formatCount: (json?.streamingData?.adaptiveFormats || []).length,
+        tookMs: Date.now() - t0,
+      };
+    } catch (e) {
+      report.tvEmbedded = { error: String(e), tookMs: Date.now() - t0 };
+    }
+  }
+
+  // Piped instances
+  report.piped = {};
+  for (const instance of PIPED_INSTANCES) {
+    const t0 = Date.now();
+    try {
+      const resp = await fetchWithTimeout(`${instance}/streams/${videoId}`, { headers: { 'Content-Type': 'application/json' } }, 6000);
+      const data = await resp.json().catch(() => null);
+      report.piped[instance] = {
+        httpStatus: resp.status,
+        audioStreamCount: (data?.audioStreams || []).length,
+        error: data?.error || null,
+        tookMs: Date.now() - t0,
+      };
+    } catch (e) {
+      report.piped[instance] = { error: String(e), tookMs: Date.now() - t0 };
+    }
+  }
+
+  return jsonResp({ videoId, report });
+}
+
+// =============================================================================
 // Route handlers
 // =============================================================================
 async function handleYtStream(videoId, waitUntil) {
@@ -652,6 +805,7 @@ export default {
 
     if (pathname === '/api/yt-stream') return handleYtStream(searchParams.get('id') || '', waitUntil);
     if (pathname === '/api/yt-proxy') return handleYtProxy(searchParams.get('id') || '', request, waitUntil);
+    if (pathname === '/api/debug-yt') return handleDebugYt(searchParams.get('id') || '');
 
     if (pathname === '/result/') return handleSaavnSearch(searchParams.get('query') || '', searchParams.get('limit') || '20');
     if (pathname === '/song/') return handleSaavnStream(searchParams.get('id') || '');
