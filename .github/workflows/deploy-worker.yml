@@ -11,14 +11,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Deploy to Cloudflare Workers
-        uses: cloudflare/wrangler-action@v3
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          secrets: |
-            CASHFREE_APP_ID
-            CASHFREE_SECRET_KEY
-          command: deploy
+      - name: Install Wrangler
+        run: npm install -g wrangler@3
+
+      - name: Verify Cloudflare token
+        run: wrangler whoami
         env:
-          CASHFREE_APP_ID: ${{ secrets.CASHFREE_APP_ID }}
-          CASHFREE_SECRET_KEY: ${{ secrets.CASHFREE_SECRET_KEY }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
+      - name: Upload Cashfree App ID secret
+        run: echo "${{ secrets.CASHFREE_APP_ID }}" | wrangler secret put CASHFREE_APP_ID
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
+      - name: Upload Cashfree Secret Key
+        run: echo "${{ secrets.CASHFREE_SECRET_KEY }}" | wrangler secret put CASHFREE_SECRET_KEY
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
+      - name: Deploy Worker
+        run: wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
