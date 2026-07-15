@@ -18,18 +18,22 @@ jobs:
         run: wrangler whoami
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: a869931c0fa8f241b35063614f11d651
 
       - name: Upload Cashfree App ID secret
         run: echo "${{ secrets.CASHFREE_APP_ID }}" | wrangler secret put CASHFREE_APP_ID
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: a869931c0fa8f241b35063614f11d651
 
       - name: Upload Cashfree Secret Key
         run: echo "${{ secrets.CASHFREE_SECRET_KEY }}" | wrangler secret put CASHFREE_SECRET_KEY
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: a869931c0fa8f241b35063614f11d651
 
       - name: Deploy Worker
         run: wrangler deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: a869931c0fa8f241b35063614f11d651
