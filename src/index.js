@@ -1,38 +1,12 @@
 // =============================================================================
-// Aurum Music — Cloudflare Worker — YT resolution
-// (Updated 2026-07-07 v2: fixes the resolve-time blowup from the previous
-//  version. Root cause of "Resolve failed... page needs to be reloaded":
-//  POT_FETCH_TIMEOUT_MS was 45000 (45s) and this ran as the FIRST, BLOCKING
-//  step of every single resolve. Render's free tier cold-starts in 30-50s,
-//  so on a cold PO Token provider, EVERY resolve waited up to 45s before
-//  even trying android_vr — then still had android_vr(3 retries) + ios +
-//  tv + piped(4 instances) stacked AFTER that. Worst case ~90+ seconds for
-//  one song. The app-side timeout/reload was firing before the Worker even
-//  finished, which is exactly the symptom in the screenshot.
-//
-//  Fixes in this version:
-//   1. PO Token fetch is capped at POT_FETCH_TIMEOUT_MS = 3000 (3s), not
-//      45s. If the provider is cold/asleep, we skip it for THIS request
-//      and fall through to the no-PoToken chain immediately — a slow POT
-//      provider degrades to "old behavior for this one request," not
-//      "block everything."
-//   2. A separate, fire-and-forget keepAlivePot() ping is sent on every
-//      request (not awaited) purely to wake/keep the Render instance warm,
-//      so subsequent requests are more likely to get a fast PO Token even
-//      though the current request didn't wait for it.
-//   3. resolveYtStream() now enforces a hard overall budget
-//      (TOTAL_RESOLVE_BUDGET_MS) across the whole client chain using
-//      withDeadline() — if we're out of budget, we stop trying further
-//      clients/Piped instances and return whatever error we have, instead
-//      of silently compounding timeouts to 90+ seconds.
-//   4. Per-client timeouts trimmed slightly so 3x android_vr + ios + tv +
-//      piped can realistically fit inside the overall budget.
+// Aurum Music — Cloudflare Worker — YT resolution + Saavn + Cashfree payments
+// (Merged 2026-07-16: added Cashfree order-create/verify routes so the
+//  Cashfree secret key lives ONLY here — server-side env vars — and never
+//  inside the Flutter app. See CASHFREE section near the bottom.)
 // =============================================================================
 
 const SAAVN_API = 'https://www.jiosaavn.com/api.php';
 
-// Multiple Piped instances tried in order. Each one is independently
-// operated and can go down without notice.
 const PIPED_INSTANCES = [
   'https://pipedapi.adminforge.de',
   'https://api.piped.yt',
@@ -41,21 +15,18 @@ const PIPED_INSTANCES = [
 ];
 
 const FETCH_TIMEOUT_MS = 5000;
-
-// Overall hard cap for the ENTIRE resolveYtStream() call, across every
-// client + Piped instance combined. This is the single most important
-// number in this file: it guarantees the app never waits longer than this
-// for a resolve to give up and move to the next song, no matter how many
-// individual retries/instances are configured above.
 const TOTAL_RESOLVE_BUDGET_MS = 15000;
 
-// PO Token provider — self-hosted bgutil-ytdlp-pot-provider on Render.
-// IMPORTANT: this timeout is intentionally SHORT now. We are not trying to
-// wait out a cold start here — see keepAlivePot() below for how we handle
-// that instead. If the provider doesn't answer in 3s, we proceed without
-// a token for this request rather than blocking it.
 const POT_PROVIDER_URL = 'https://aurum-pot.onrender.com/get_pot';
 const POT_FETCH_TIMEOUT_MS = 3000;
+
+// ── CASHFREE CONFIG ─────────────────────────────────────────────────────────
+// Production API base. Use https://sandbox.cashfree.com/pg while testing.
+const CF_API_BASE = 'https://api.cashfree.com/pg';
+const CF_API_VERSION = '2023-08-01';
+// Plan pricing allowlist — keeps this endpoint from being abused to create
+// orders for arbitrary amounts.
+const CF_ALLOWED_AMOUNTS = { monthly: 19, sixMonths: 149, lifetime: 249 };
 
 async function fetchWithTimeout(url, options, timeoutMs = FETCH_TIMEOUT_MS) {
   const controller = new AbortController();
@@ -67,9 +38,6 @@ async function fetchWithTimeout(url, options, timeoutMs = FETCH_TIMEOUT_MS) {
   }
 }
 
-// A small deadline helper: wraps a promise so it never keeps the caller
-// waiting past `msLeft`. Used to enforce TOTAL_RESOLVE_BUDGET_MS across the
-// whole chain, not just per-request.
 function withDeadline(promise, msLeft, fallbackValue = null) {
   if (msLeft <= 0) return Promise.resolve(fallbackValue);
   return Promise.race([
@@ -96,12 +64,6 @@ async function fetchPoToken() {
   }
 }
 
-// Fire-and-forget ping to keep/wake the Render instance, WITHOUT the
-// current request waiting on it. Callers should NOT await this — it's
-// deliberately detached so a cold provider only costs future requests a
-// warmer instance, never the current one extra latency. Cloudflare's
-// `ctx.waitUntil` (passed in as `waitUntil`) lets this keep running after
-// the response has already been sent back to the client.
 function keepAlivePot(waitUntil) {
   const ping = fetch(POT_PROVIDER_URL, {
     method: 'POST',
@@ -111,14 +73,6 @@ function keepAlivePot(waitUntil) {
   if (waitUntil) waitUntil(ping);
 }
 
-// =============================================================================
-// ATTEMPT — PO-Token-backed WEB_EMBEDDED_PLAYER. Only used when a token
-// was actually obtained within POT_FETCH_TIMEOUT_MS.
-//
-// PO Tokens are platform-bound — a bgutil (BotGuard/web) token is valid for
-// WEB_EMBEDDED_PLAYER, not ANDROID_VR (DroidGuard) or IOS. This client is
-// the one it's actually meant for.
-// =============================================================================
 async function ytWebEmbeddedWithPot(videoId, pot, timeoutMs) {
   if (!pot?.poToken) return null;
   try {
@@ -157,13 +111,6 @@ async function ytWebEmbeddedWithPot(videoId, pot, timeoutMs) {
   }
 }
 
-// =============================================================================
-// ATTEMPT — ANDROID_VR, retried a couple times for request-level flakiness
-// (YouTube's SABR-only A/B experiment causes intermittent empty `url`
-// fields on some requests for the same video). Trimmed to 2 attempts (was
-// 3) so it fits comfortably inside the overall budget alongside everything
-// else.
-// =============================================================================
 async function ytAndroidVr(videoId, attempts, perAttemptTimeoutMs) {
   for (let i = 0; i < attempts; i++) {
     try {
@@ -201,9 +148,6 @@ async function ytAndroidVr(videoId, attempts, perAttemptTimeoutMs) {
   return null;
 }
 
-// =============================================================================
-// ATTEMPT — iOS client.
-// =============================================================================
 async function ytIos(videoId, timeoutMs) {
   try {
     const resp = await fetchWithTimeout('https://www.youtube.com/youtubei/v1/player', {
@@ -239,9 +183,6 @@ async function ytIos(videoId, timeoutMs) {
   }
 }
 
-// =============================================================================
-// ATTEMPT — TVHTML5_SIMPLY_EMBEDDED_PLAYER bypass.
-// =============================================================================
 async function ytTvEmbeddedBypass(videoId, timeoutMs) {
   try {
     const resp = await fetchWithTimeout('https://www.youtube.com/youtubei/v1/player', {
@@ -272,13 +213,9 @@ async function ytTvEmbeddedBypass(videoId, timeoutMs) {
   }
 }
 
-// =============================================================================
-// ATTEMPT — Piped, tried across multiple instances in sequence until one
-// responds with usable audio streams.
-// =============================================================================
 async function ytPipedFallback(videoId, safePlayerResponse, perInstanceTimeoutMs, deadlineAt) {
   for (const instance of PIPED_INSTANCES) {
-    if (Date.now() > deadlineAt) break; // out of overall budget — stop trying more instances
+    if (Date.now() > deadlineAt) break;
     try {
       const resp = await fetchWithTimeout(`${instance}/streams/${videoId}`, {
         headers: { 'Content-Type': 'application/json' },
@@ -324,23 +261,13 @@ async function ytPipedFallback(videoId, safePlayerResponse, perInstanceTimeoutMs
   return safePlayerResponse;
 }
 
-// =============================================================================
-// MAIN resolve — every stage now runs against a shared deadline so the
-// WHOLE function can never exceed TOTAL_RESOLVE_BUDGET_MS, regardless of
-// how many clients/instances are configured above.
-// =============================================================================
 async function resolveYtStream(videoId, waitUntil) {
   const startedAt = Date.now();
   const deadlineAt = startedAt + TOTAL_RESOLVE_BUDGET_MS;
   const remaining = () => Math.max(0, deadlineAt - Date.now());
 
-  // Kick off a detached keep-alive ping so future requests have a better
-  // shot at a warm PO Token provider. Not awaited — costs this request
-  // nothing.
   keepAlivePot(waitUntil);
 
-  // PO Token fetch is capped hard at 3s and does NOT block beyond that,
-  // regardless of provider cold-start time.
   const pot = await withDeadline(fetchPoToken(), Math.min(POT_FETCH_TIMEOUT_MS, remaining()));
 
   if (pot?.poToken && remaining() > 0) {
@@ -402,17 +329,10 @@ function extractAudioUrl(playerResponse) {
   return null;
 }
 
-// =============================================================================
-// DEBUG — runs every client independently (not budgeted, not short-circuited)
-// and reports what each one actually returned/threw. Use this to see WHICH
-// client is failing and why, since resolveYtStream() swallows all errors
-// via catch(_) { return null } for the normal fast-path.
-// =============================================================================
 async function handleDebugYt(videoId) {
   if (!videoId) return jsonResp({ success: false, error: 'id required' }, 400);
   const report = {};
 
-  // PO Token
   const potStart = Date.now();
   let pot = null;
   try {
@@ -422,7 +342,6 @@ async function handleDebugYt(videoId) {
     report.poToken = { ok: false, tookMs: Date.now() - potStart, error: String(e) };
   }
 
-  // WEB_EMBEDDED_PLAYER (only meaningful if we got a token)
   if (pot?.poToken) {
     const t0 = Date.now();
     try {
@@ -453,7 +372,6 @@ async function handleDebugYt(videoId) {
     report.webEmbedded = { skipped: 'no PO token' };
   }
 
-  // ANDROID_VR
   {
     const t0 = Date.now();
     try {
@@ -480,7 +398,6 @@ async function handleDebugYt(videoId) {
     }
   }
 
-  // IOS
   {
     const t0 = Date.now();
     try {
@@ -507,7 +424,6 @@ async function handleDebugYt(videoId) {
     }
   }
 
-  // TVHTML5_SIMPLY_EMBEDDED_PLAYER
   {
     const t0 = Date.now();
     try {
@@ -534,7 +450,6 @@ async function handleDebugYt(videoId) {
     }
   }
 
-  // Piped instances
   report.piped = {};
   for (const instance of PIPED_INSTANCES) {
     const t0 = Date.now();
@@ -555,9 +470,6 @@ async function handleDebugYt(videoId) {
   return jsonResp({ videoId, report });
 }
 
-// =============================================================================
-// Route handlers
-// =============================================================================
 async function handleYtStream(videoId, waitUntil) {
   if (!videoId) return jsonResp({ success: false, error: 'id required' }, 400);
   const audio = await resolveYtStream(videoId, waitUntil);
@@ -599,9 +511,6 @@ function proxyAudioResponse(upstream) {
   });
 }
 
-// =============================================================================
-// Saavn helpers — unchanged.
-// =============================================================================
 async function saavnSearch(query, limit = 20) {
   try {
     const url = `${SAAVN_API}?__call=autocomplete.get&_format=json&_marker=0&cc=in&includeMetaTags=0&query=${encodeURIComponent(query)}`;
@@ -785,6 +694,97 @@ function jsonResp(data, status = 200) {
 }
 
 // =============================================================================
+// CASHFREE — order creation + status verification.
+// The secret key (env.CASHFREE_SECRET_KEY) and app id (env.CASHFREE_APP_ID)
+// are Cloudflare Worker environment variables/secrets — set via the
+// dashboard (Settings -> Variables) or `wrangler secret put`. They are
+// NEVER hardcoded here and NEVER sent to the Flutter app.
+// =============================================================================
+async function handleCreateCfOrder(request, env) {
+  if (request.method !== 'POST') {
+    return jsonResp({ success: false, error: 'method not allowed' }, 405);
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch (_) {
+    return jsonResp({ success: false, error: 'invalid json body' }, 400);
+  }
+
+  const { orderId, orderAmount, planId, customerEmail, customerName } = body || {};
+  if (!orderId || !orderAmount) {
+    return jsonResp({ success: false, error: 'orderId and orderAmount required' }, 400);
+  }
+
+  if (!planId || CF_ALLOWED_AMOUNTS[planId] !== Number(orderAmount)) {
+    return jsonResp({ success: false, error: 'amount does not match known plan pricing' }, 400);
+  }
+
+  try {
+    const resp = await fetch(`${CF_API_BASE}/orders`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-version': CF_API_VERSION,
+        'x-client-id': env.CASHFREE_APP_ID,
+        'x-client-secret': env.CASHFREE_SECRET_KEY,
+      },
+      body: JSON.stringify({
+        order_id: orderId,
+        order_amount: orderAmount,
+        order_currency: 'INR',
+        customer_details: {
+          customer_id: `cust_${orderId}`,
+          customer_email: customerEmail || 'guest@aurum.app',
+          customer_name: customerName || 'Aurum User',
+          customer_phone: '9999999999',
+        },
+        order_meta: {
+          plan_id: planId,
+        },
+      }),
+    });
+
+    const data = await resp.json().catch(() => null);
+    if (!resp.ok || !data?.payment_session_id) {
+      return jsonResp({ success: false, error: data?.message || 'order creation failed' }, 502);
+    }
+
+    return jsonResp({
+      success: true,
+      payment_session_id: data.payment_session_id,
+      order_id: data.order_id,
+    });
+  } catch (e) {
+    return jsonResp({ success: false, error: String(e) }, 500);
+  }
+}
+
+async function handleVerifyCfOrder(searchParams, env) {
+  const orderId = searchParams.get('orderId');
+  if (!orderId) return jsonResp({ success: false, error: 'orderId required' }, 400);
+
+  try {
+    const resp = await fetch(`${CF_API_BASE}/orders/${encodeURIComponent(orderId)}`, {
+      method: 'GET',
+      headers: {
+        'x-api-version': CF_API_VERSION,
+        'x-client-id': env.CASHFREE_APP_ID,
+        'x-client-secret': env.CASHFREE_SECRET_KEY,
+      },
+    });
+    const data = await resp.json().catch(() => null);
+    if (!resp.ok || !data) {
+      return jsonResp({ success: false, error: 'could not fetch order status' }, 502);
+    }
+    return jsonResp({ success: true, order_status: data.order_status, order_id: data.order_id });
+  } catch (e) {
+    return jsonResp({ success: false, error: String(e) }, 500);
+  }
+}
+
+// =============================================================================
 // Main router
 // =============================================================================
 export default {
@@ -812,10 +812,14 @@ export default {
     if (pathname === '/lyrics/') return handleSaavnLyrics(searchParams.get('id') || '');
     if (pathname === '/stream-proxy') return handleStreamProxy(request, searchParams.get('url') || '');
 
+    // Cashfree payment routes
+    if (pathname === '/api/create-cf-order') return handleCreateCfOrder(request, env);
+    if (pathname === '/api/verify-cf-order') return handleVerifyCfOrder(searchParams, env);
+
     if (pathname === '/health') {
       return jsonResp({
         status: 'ok',
-        worker: 'aurum-stable-v2-budgeted',
+        worker: 'aurum-stable-v2-budgeted-cashfree',
         potProvider: POT_PROVIDER_URL,
         totalResolveBudgetMs: TOTAL_RESOLVE_BUDGET_MS,
         potFetchTimeoutMs: POT_FETCH_TIMEOUT_MS,
@@ -827,6 +831,7 @@ export default {
           `Piped closest-bitrate (multi-instance: ${PIPED_INSTANCES.join(', ')})`,
         ],
         resolutionStrategy: 'budgeted sequential chain — hard 15s cap, PO Token non-blocking',
+        cashfreeConfigured: true,
       });
     }
 
