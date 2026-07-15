@@ -18,6 +18,7 @@ jobs:
           secrets: |
             CASHFREE_APP_ID
             CASHFREE_SECRET_KEY
+          command: deploy
         env:
           CASHFREE_APP_ID: ${{ secrets.CASHFREE_APP_ID }}
           CASHFREE_SECRET_KEY: ${{ secrets.CASHFREE_SECRET_KEY }}
