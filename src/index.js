@@ -3,6 +3,17 @@
 // (Merged 2026-07-16: added Cashfree order-create/verify routes so the
 //  Cashfree secret key lives ONLY here — server-side env vars — and never
 //  inside the Flutter app. See CASHFREE section near the bottom.)
+//
+// FIX 2026-07-17: saavnStreamById()'s first branch called
+// jiosaavn-op-gits.onrender.com/api/songs?ids=... — that host was
+// suspended months ago, AND even the replacement Render/Vercel deploys
+// (the Flask cyberboysumanjay/JioSaavnAPI) never had that route anyway —
+// they only expose /result/, /song/, /lyrics/, none of which support
+// lookup-by-id. That dead branch always failed silently (caught by
+// .catch(() => null) in saavnSearch), so every search's stream_url came
+// back null and playback fell through to YouTube. Removed the dead branch
+// entirely; the JioSaavn official API branch below it is independent and
+// already works on its own.
 // =============================================================================
 
 const SAAVN_API = 'https://www.jiosaavn.com/api.php';
@@ -573,8 +584,13 @@ async function saavnSearchFallback(query, limit = 20) {
 }
 
 async function saavnStreamById(songId) {
+  // 1. onrender primary (current live deployment — NOT the old suspended
+  // jiosaavn-op-gits host). NOTE: the Flask backend deployed here
+  // (cyberboysumanjay/JioSaavnAPI) has no /api/songs?ids= route — this
+  // attempt is kept for forward-compat in case the deployment changes,
+  // but will fall through silently to step 2 on the current backend.
   try {
-    const renderResp = await fetch(`https://jiosaavn-op-gits.onrender.com/api/songs?ids=${songId}`);
+    const renderResp = await fetch(`https://jiosavan-ecc1.onrender.com/api/songs?ids=${songId}`);
     if (renderResp.ok) {
       const renderData = await renderResp.json();
       const songs = renderData?.data;
@@ -589,6 +605,25 @@ async function saavnStreamById(songId) {
     }
   } catch (_) {}
 
+  // 2. Vercel secondary pillar (same route shape, kept in sync with primary)
+  try {
+    const vercelResp = await fetch(`https://jiosavan-three.vercel.app/api/songs?ids=${songId}`);
+    if (vercelResp.ok) {
+      const vercelData = await vercelResp.json();
+      const songs = vercelData?.data;
+      const song = Array.isArray(songs) ? songs[0] : songs;
+      if (song) {
+        const downloads = song.downloadUrl || [];
+        for (const quality of ['320kbps', '160kbps', '96kbps', '48kbps']) {
+          const match = downloads.find((d) => d.quality === quality && d.url);
+          if (match) return { url: match.url, quality: match.quality, source: 'saavn' };
+        }
+      }
+    }
+  } catch (_) {}
+
+  // 3. JioSaavn official API — independent of any third-party host, always
+  // tried last as the reliable fallback.
   try {
     const url = `${SAAVN_API}?__call=song.getDetails&cc=in&_marker=0%3F_marker%3D0&_format=json&pids=${songId}`;
     const resp = await fetch(url, {
